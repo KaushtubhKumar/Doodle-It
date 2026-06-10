@@ -1,4 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
+import { debounce } from 'lodash';
 import { ChatMessage } from '../../types';
 
 interface Props {
@@ -23,20 +24,45 @@ export const ChatBox: React.FC<Props> = ({
   const [input, setInput] = useState('');
   const bottomRef = useRef<HTMLDivElement>(null);
 
+  // Auto-scroll to the bottom when a new message arrives
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
+
+  /* We wrap the debounce inside a useRef hook. 
+    This is extremely important in React because otherwise, every time the component 
+    re-renders (e.g., when you type a character), a brand new debounce timer instance 
+    is created, which completely breaks the debounce logic and allows spamming.
+  */
+  const debouncedSendRef = useRef(
+    debounce(
+      (text: string, currentIsDrawer: boolean) => {
+        if (currentIsDrawer) {
+          onSendMessage(roomId, text, playerName);
+        } else {
+          onSendGuess(roomId, text, playerId, playerName);
+        }
+      },
+      400, // 400ms cooling period to prevent fast message/guess macros
+      { leading: true, trailing: false } // Fires the message instantly on the first click, then locks out for 400ms
+    )
+  );
+
+  // Clean up the debounce timer if the component ever unmounts to prevent memory leaks
+  useEffect(() => {
+    const currentDebounce = debouncedSendRef.current;
+    return () => {
+      currentDebounce.cancel();
+    };
+  }, []);
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     const text = input.trim();
     if (!text) return;
 
-    if (isDrawer) {
-      onSendMessage(roomId, text, playerName);
-    } else {
-      onSendGuess(roomId, text, playerId, playerName);
-    }
+    // Pass down arguments safely into the stable debounced execution context
+    debouncedSendRef.current(text, isDrawer);
     setInput('');
   };
 
@@ -76,7 +102,7 @@ export const ChatBox: React.FC<Props> = ({
         <div ref={bottomRef} />
       </div>
 
-      {/* Input */}
+      {/* Input Form */}
       <form onSubmit={handleSubmit} className="flex border-t border-gray-200">
         <input
           type="text"

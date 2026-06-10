@@ -1,5 +1,6 @@
 import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { DrawPoint } from '../../types';
+import { throttle } from 'lodash';
 
 interface Props {
   isDrawer: boolean;
@@ -104,11 +105,26 @@ export const DrawingCanvas: React.FC<Props> = ({
     };
   };
 
-  const emitPoint = useCallback(
+  const throttledNetworkDraw = useRef(
+    throttle((id: string, pt: DrawPoint, drawCb: typeof onDraw) => {
+      drawCb(id, pt);
+    }, 30) // 30ms = ~33 network events per second
+  ).current;
+
+ const emitPoint = useCallback(
     (type: DrawPoint['type'], x: number, y: number) => {
       const point: DrawPoint = { x, y, color, strokeWidth, type };
-      drawPoint(point); // draw locally immediately
-      onDraw(roomId, point);
+      
+      // 1. Draw locally IMMEDIATELY so the user experiences zero lag
+      drawPoint(point); 
+      
+      // 2. Throttle the network emission to the server
+      // We always send 'start' and 'end' events immediately, only throttle 'draw'
+      if (type === 'start' || type === 'end') {
+        onDraw(roomId, point);
+      } else {
+        throttledNetworkDraw(roomId, point, onDraw);
+      }
     },
     [color, strokeWidth, drawPoint, onDraw, roomId]
   );
