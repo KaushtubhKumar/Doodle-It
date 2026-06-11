@@ -1,6 +1,7 @@
 import { useEffect, useCallback } from 'react';
 import { socket, connectSocket } from '../utils/socket';
 import { useGameStore } from '../context/gameStore';
+
 import {
   Room,
   LobbyRoom,
@@ -96,12 +97,12 @@ socket.on('playerDisconnected', ({ socketId }: { socketId: string }) => {
 });
 
 socket.on('rejoinSuccess', (room: Room) => {
-  useGameStore.getState().setRoom(room);
+  store.setRoom(room);
+  if (room.isPlaying) store.setPhase('drawing');
 });
 
 socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
   console.warn('Rejoin failed:', reason);
-  useGameStore.getState().leaveRoom();
 });
 
     // ── Game flow ────────────────────────────────────────────────────────
@@ -167,6 +168,8 @@ socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
       socket.off(EVENTS.TURN_ENDED, onTurnEnded);
       socket.off(EVENTS.GAME_ENDED, onGameEnded);
       socket.off(EVENTS.NEW_MESSAGE, onNewMessage);
+      socket.off('rejoinSuccess');
+      socket.off('rejoinFailed');
       // No disconnectSocket() — socket stays alive across re-renders
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps

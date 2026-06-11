@@ -2,6 +2,8 @@ import { Server, Socket } from 'socket.io';
 import { v4 as uuidv4 } from 'uuid';
 import { UserModel } from '../models/User';
 import { roomManager } from './roomManager';
+import jwt from 'jsonwebtoken';
+import { redis } from '../utils/redis';
 import {
   SOCKET_EVENTS,
   JoinRoomPayload,
@@ -49,8 +51,34 @@ function broadcastHint(io: Server, roomId: string, drawerSocketId: string, hint:
 const endingTurns = new Set<string>();
 
 export function registerSocketHandlers(io: Server): void {
-  io.on('connection', (socket: Socket) => {
+  io.on('connection',async (socket: Socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
+
+    let currentRoomId: string | null = null;
+
+    // Auto-rejoin on reconnect
+const token = socket.handshake.auth?.token as string | undefined;
+if (token) {
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { id: string };
+    const roomId = await redis.get(`player:${decoded.id}:room`);
+    if (roomId) {
+      const room = await roomManager.rejoinRoom(roomId, decoded.id, socket.id);
+      if (room) {
+        socket.join(roomId);
+        currentRoomId = roomId;
+        socket.emit('rejoinSuccess', room);
+        socket.to(roomId).emit('roomUpdate', room);
+      } else {
+        await redis.del(`player:${decoded.id}:room`);
+      }
+    }
+  } catch {
+    // fresh connection, no prior room
+  }
+}
+
+    
 
     socket.on(SOCKET_EVENTS.GET_ROOMS, () => {
       const rooms = roomManager.getAll().map((r) => ({
@@ -65,8 +93,8 @@ export function registerSocketHandlers(io: Server): void {
       socket.emit(SOCKET_EVENTS.ROOMS_LIST, rooms);
     });
 
-    socket.on('rejoinRoom', ({ roomId, userId }: { roomId: string; userId: string }) => {
-  const room = roomManager.rejoinRoom(roomId, userId, socket.id);
+    socket.on('rejoinRoom', async ({ roomId, userId }: { roomId: string; userId: string }) => {
+  const room =await roomManager.rejoinRoom(roomId, userId, socket.id);
   if (!room) {
     socket.emit('rejoinFailed', { reason: 'Room no longer exists.' });
     return;
@@ -99,6 +127,7 @@ export function registerSocketHandlers(io: Server): void {
       });
 
       socket.join(room.id);
+      currentRoomId = room.id;
       socket.emit(SOCKET_EVENTS.ROOM_CREATED, room);
       broadcastLobby(io);
       console.log(`[Socket] Room created: ${room.id}`);
@@ -123,6 +152,7 @@ export function registerSocketHandlers(io: Server): void {
       }
 
       socket.join(room.id);
+      currentRoomId = room.id;
       socket.emit(SOCKET_EVENTS.ROOM_JOINED, room);
       socket.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
       io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg(`${player.name} joined the room!`));
@@ -133,6 +163,7 @@ export function registerSocketHandlers(io: Server): void {
     socket.on(SOCKET_EVENTS.LEAVE_ROOM, (roomId: string) => {
       const result = roomManager.removePlayer(socket.id);
       socket.leave(roomId);
+      currentRoomId = null;
       if (result) {
         const { room, wasDrawer } = result;
         io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg('A player left the room.'));
@@ -228,15 +259,15 @@ export function registerSocketHandlers(io: Server): void {
     // });
 
 
-    socket.on('disconnect', () => {
-  for (const roomId of socket.rooms) {
-    if (roomId === socket.id) continue;
-    // Hold slot for 30s instead of removing immediately
-    roomManager.markDisconnected(socket.id, roomId);
-    // Notify others the player went offline
-    socket.to(roomId).emit('playerDisconnected', { socketId: socket.id });
-  }
+socket.on('disconnect', async () => {
+  console.log(`[Socket] Disconnected: ${socket.id}`);
+  if (!currentRoomId) return;
+
+  await roomManager.markDisconnected(socket.id, currentRoomId);
+  socket.to(currentRoomId).emit('playerDisconnected', { socketId: socket.id });
+  broadcastLobby(io);
 });
+
   });
 }
 

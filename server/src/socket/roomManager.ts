@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from 'uuid';
 import { Room, Player } from '../types';
+import { redis } from '../utils/redis';
 
 const WORDS: string[] = [
   'apple', 'banana', 'castle', 'dragon', 'elephant', 'flower', 'guitar',
@@ -46,6 +47,7 @@ class RoomManager {
       isPlaying: false,
     };
     this.rooms.set(id, room);
+    redis.set(`player:${opts.creatorPlayer.userId}:room`, id, 'EX', 7200).catch(() => {}); // ADD
     return room;
   }
 
@@ -69,6 +71,9 @@ class RoomManager {
     if (room.players.length >= room.maxPlayers) return null;
     if (room.players.find((p) => p.socketId === player.socketId)) return room;
     room.players.push(player);
+
+    // Persist userId → roomId so rejoin works across restarts
+    redis.set(`player:${player.userId}:room`, room.id, 'EX', 7200).catch(() => {});
     return room;
   }
 
@@ -76,6 +81,10 @@ class RoomManager {
     for (const room of this.rooms.values()) {
       const idx = room.players.findIndex((p) => p.socketId === socketId);
       if (idx !== -1) {
+                // Clear Redis entry on intentional leave
+        const player = room.players[idx]; // grab before splice — adjust: splice mutates so grab first
+        redis.del(`player:${player.userId}:room`).catch(() => {});       
+
         const wasDrawer = room.currentDrawer === socketId;
         room.players.splice(idx, 1);
         if (wasDrawer) room.currentDrawer = undefined;
@@ -219,7 +228,7 @@ class RoomManager {
 // Track disconnected players: socketId → { roomId, playerId, timer }
 private disconnected = new Map<string, { roomId: string; playerId: string; timer: ReturnType<typeof setTimeout> }>();
 
-markDisconnected(socketId: string, roomId: string): void {
+async markDisconnected(socketId: string, roomId: string): Promise<void> {
   const room = this.rooms.get(roomId);
   if (!room) return;
 
@@ -228,36 +237,47 @@ markDisconnected(socketId: string, roomId: string): void {
 
   player.isConnected = false;
 
-  // Hold the slot for 30 seconds before removing
+  // Store in Redis with 35s TTL (5s buffer over the 30s hold window)
+  await redis.set(
+    `disconnected:${player.userId}`,
+    JSON.stringify({ roomId, socketId }),
+    'EX', 35
+  ).catch(() => {});
+
+  // Still use local setTimeout to trigger removal — Redis TTL is just the backup
   const timer = setTimeout(() => {
     this.forceRemovePlayer(roomId, socketId);
+    redis.del(`disconnected:${player.userId}`).catch(() => {});
   }, 30_000);
 
   this.disconnected.set(socketId, { roomId, playerId: player.userId, timer });
 }
 
-rejoinRoom(roomId: string, playerId: string, newSocketId: string): Room | null {
+async rejoinRoom(roomId: string, playerId: string, newSocketId: string): Promise<Room | null> {
   const room = this.rooms.get(roomId);
   if (!room) return null;
 
   const player = room.players.find(p => p.userId === playerId);
-  if (!player) return null;
-
-  // Cancel the removal timer
-  const held = [...this.disconnected.values()].find(d => d.playerId === playerId && d.roomId === roomId);
-  if (held) {
-    clearTimeout(held.timer);
-    // Remove old socketId entry
-    for (const [sid, d] of this.disconnected) {
-      if (d.playerId === playerId) { this.disconnected.delete(sid); break; }
+  
+  // Player still in room (within 30s window) — just update their socket
+  if (player) {
+    const held = [...this.disconnected.values()]
+      .find(d => d.playerId === playerId && d.roomId === roomId);
+    if (held) {
+      clearTimeout(held.timer);
+      for (const [sid, d] of this.disconnected) {
+        if (d.playerId === playerId) { this.disconnected.delete(sid); break; }
+      }
     }
+    await redis.del(`disconnected:${playerId}`).catch(() => {});
+    player.socketId    = newSocketId;
+    player.isConnected = true;
+    return room;
   }
 
-  player.socketId    = newSocketId;
-  player.isConnected = true;
-  return room;
+  // Player was already removed (30s expired) — cannot rejoin mid-game
+  return null;
 }
-
 private forceRemovePlayer(roomId: string, socketId: string): void {
   const room = this.rooms.get(roomId);
   if (!room) return;
