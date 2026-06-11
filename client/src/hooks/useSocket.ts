@@ -86,6 +86,24 @@ export function useSocket(): UseSocketReturn {
       alert(`Socket error: ${msg}`);
     };
 
+socket.on('playerDisconnected', ({ socketId }: { socketId: string }) => {
+  const room = useGameStore.getState().room;
+  if (!room) return;
+  const updated = { ...room, players: room.players.map(p =>
+    p.socketId === socketId ? { ...p, isConnected: false } : p
+  )};
+  useGameStore.getState().updateRoom(updated);
+});
+
+socket.on('rejoinSuccess', (room: Room) => {
+  useGameStore.getState().setRoom(room);
+});
+
+socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
+  console.warn('Rejoin failed:', reason);
+  useGameStore.getState().leaveRoom();
+});
+
     // ── Game flow ────────────────────────────────────────────────────────
     // GAME_STARTED: just update the room object — do NOT force phase to 'drawing'
     // here. The phase transition happens on NEW_TURN so the drawer's word arrives

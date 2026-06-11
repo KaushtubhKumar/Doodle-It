@@ -65,6 +65,19 @@ export function registerSocketHandlers(io: Server): void {
       socket.emit(SOCKET_EVENTS.ROOMS_LIST, rooms);
     });
 
+    socket.on('rejoinRoom', ({ roomId, userId }: { roomId: string; userId: string }) => {
+  const room = roomManager.rejoinRoom(roomId, userId, socket.id);
+  if (!room) {
+    socket.emit('rejoinFailed', { reason: 'Room no longer exists.' });
+    return;
+  }
+  socket.join(roomId);
+  // Send them the full current room state so they can restore
+  socket.emit('rejoinSuccess', room);
+  // Tell others this player is back
+  socket.to(roomId).emit('roomUpdate', room);
+});
+
     socket.on(SOCKET_EVENTS.CREATE_ROOM, (payload: CreateRoomPayload) => {
       const creator: Player = {
         userId: payload.userId,
@@ -74,6 +87,7 @@ export function registerSocketHandlers(io: Server): void {
         isDrawing: false,
         hasGuessedCorrectly: false,
         socketId: socket.id,
+         isConnected: true,
       };
 
       const room = roomManager.create({
@@ -99,6 +113,7 @@ export function registerSocketHandlers(io: Server): void {
         isDrawing: false,
         hasGuessedCorrectly: false,
         socketId: socket.id,
+         isConnected: true,
       };
 
       const room = roomManager.addPlayer(payload.roomId, player);
@@ -200,17 +215,28 @@ export function registerSocketHandlers(io: Server): void {
       }
     });
 
-    socket.on(SOCKET_EVENTS.DISCONNECT, () => {
-      console.log(`[Socket] Disconnected: ${socket.id}`);
-      const result = roomManager.removePlayer(socket.id);
-      if (result) {
-        const { room, wasDrawer } = result;
-        io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg('A player left the room.'));
-        io.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
-        if (wasDrawer && room.isPlaying) endTurn(io, room.id);
-      }
-      broadcastLobby(io);
-    });
+    // socket.on(SOCKET_EVENTS.DISCONNECT, () => {
+    //   console.log(`[Socket] Disconnected: ${socket.id}`);
+    //   const result = roomManager.removePlayer(socket.id);
+    //   if (result) {
+    //     const { room, wasDrawer } = result;
+    //     io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg('A player left the room.'));
+    //     io.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
+    //     if (wasDrawer && room.isPlaying) endTurn(io, room.id);
+    //   }
+    //   broadcastLobby(io);
+    // });
+
+
+    socket.on('disconnect', () => {
+  for (const roomId of socket.rooms) {
+    if (roomId === socket.id) continue;
+    // Hold slot for 30s instead of removing immediately
+    roomManager.markDisconnected(socket.id, roomId);
+    // Notify others the player went offline
+    socket.to(roomId).emit('playerDisconnected', { socketId: socket.id });
+  }
+});
   });
 }
 

@@ -9,6 +9,11 @@ import { ChatBox } from '../components/Chat/ChatBox';
 import { Scoreboard } from '../components/Game/Scoreboard';
 import { GameHeader } from '../components/Game/GameHeader';
 import { GameOverScreen } from '../components/Game/GameOverScreen';
+// At the top with other imports:
+import { useRejoin } from '../hooks/useRejoin';
+
+// Inside the GamePage component, with your other hooks:
+
 
 export const GamePage: React.FC = () => {
   const navigate = useNavigate();
@@ -48,6 +53,9 @@ export const GamePage: React.FC = () => {
 
   // Use mySocketId from Zustand store — set reliably on socket 'connect' event.
   // Never read socket.id directly in render; it's undefined until after connect.
+
+  useRejoin();
+  
   const isDrawer =
     !!mySocketId &&
     (room.currentDrawer === mySocketId ||

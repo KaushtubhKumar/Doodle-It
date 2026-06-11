@@ -213,6 +213,60 @@ class RoomManager {
   // Kept for backward compat — no-ops now that we use intervals instead
   setTimer(_roomId: string, _cb: () => void, _ms: number): void {}
   clearTimer(_roomId: string): void {}
+
+  // ── Reconnection support ──────────────────────────────────────────────────
+
+// Track disconnected players: socketId → { roomId, playerId, timer }
+private disconnected = new Map<string, { roomId: string; playerId: string; timer: ReturnType<typeof setTimeout> }>();
+
+markDisconnected(socketId: string, roomId: string): void {
+  const room = this.rooms.get(roomId);
+  if (!room) return;
+
+  const player = room.players.find(p => p.socketId === socketId);
+  if (!player) return;
+
+  player.isConnected = false;
+
+  // Hold the slot for 30 seconds before removing
+  const timer = setTimeout(() => {
+    this.forceRemovePlayer(roomId, socketId);
+  }, 30_000);
+
+  this.disconnected.set(socketId, { roomId, playerId: player.userId, timer });
+}
+
+rejoinRoom(roomId: string, playerId: string, newSocketId: string): Room | null {
+  const room = this.rooms.get(roomId);
+  if (!room) return null;
+
+  const player = room.players.find(p => p.userId === playerId);
+  if (!player) return null;
+
+  // Cancel the removal timer
+  const held = [...this.disconnected.values()].find(d => d.playerId === playerId && d.roomId === roomId);
+  if (held) {
+    clearTimeout(held.timer);
+    // Remove old socketId entry
+    for (const [sid, d] of this.disconnected) {
+      if (d.playerId === playerId) { this.disconnected.delete(sid); break; }
+    }
+  }
+
+  player.socketId    = newSocketId;
+  player.isConnected = true;
+  return room;
+}
+
+private forceRemovePlayer(roomId: string, socketId: string): void {
+  const room = this.rooms.get(roomId);
+  if (!room) return;
+  room.players = room.players.filter(p => p.socketId !== socketId);
+  if (room.players.length === 0) {
+    this.rooms.delete(roomId);
+  }
+  this.disconnected.delete(socketId);
+}
 }
 
 export const roomManager = new RoomManager();

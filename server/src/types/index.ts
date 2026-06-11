@@ -19,6 +19,7 @@ export interface Player {
   isDrawing: boolean;
   hasGuessedCorrectly: boolean;
   socketId: string;
+  isConnected: boolean;
 }
 
 export interface Room {
