@@ -78,8 +78,6 @@ if (token) {
   }
 }
 
-    
-
     socket.on(SOCKET_EVENTS.GET_ROOMS, () => {
       const rooms = roomManager.getAll().map((r) => ({
         id: r.id,
