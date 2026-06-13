@@ -36,7 +36,6 @@ function broadcastLobby(io: Server): void {
   io.emit(SOCKET_EVENTS.ROOMS_LIST, allRooms);
 }
 
-// Emit hint update to all sockets in the room except the drawer
 function broadcastHint(io: Server, roomId: string, drawerSocketId: string, hint: string): void {
   const roomSockets = io.sockets.adapter.rooms.get(roomId);
   if (!roomSockets) return;
@@ -51,33 +50,34 @@ function broadcastHint(io: Server, roomId: string, drawerSocketId: string, hint:
 const endingTurns = new Set<string>();
 
 export function registerSocketHandlers(io: Server): void {
-  io.on('connection',async (socket: Socket) => {
+  io.on('connection', async (socket: Socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
 
     let currentRoomId: string | null = null;
 
-    // Auto-rejoin on reconnect
-const token = socket.handshake.auth?.token as string | undefined;
-if (token) {
-  try {
-    const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { id: string };
-    const roomId = await redis.get(`player:${decoded.id}:room`);
-    if (roomId) {
-      const room = await roomManager.rejoinRoom(roomId, decoded.id, socket.id);
-      if (room) {
-        socket.join(roomId);
-        currentRoomId = roomId;
-        socket.emit('rejoinSuccess', room);
-        socket.to(roomId).emit('roomUpdate', room);
-      } else {
-        await redis.del(`player:${decoded.id}:room`);
+    // ── Auto-rejoin on reconnect ──────────────────────────────────────────
+    const token = socket.handshake.auth?.token as string | undefined;
+    if (token) {
+      try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { id: string };
+        const roomId = await redis.get(`player:${decoded.id}:room`);
+        if (roomId) {
+          const room = await roomManager.rejoinRoom(roomId, decoded.id, socket.id);
+          if (room) {
+            socket.join(roomId);
+            currentRoomId = roomId;
+            socket.emit('rejoinSuccess', room);
+            socket.to(roomId).emit('roomUpdate', room);
+          } else {
+            await redis.del(`player:${decoded.id}:room`);
+          }
+        }
+      } catch {
+        // fresh connection, no prior room
       }
     }
-  } catch {
-    // fresh connection, no prior room
-  }
-}
 
+    // ── Lobby ─────────────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.GET_ROOMS, () => {
       const rooms = roomManager.getAll().map((r) => ({
         id: r.id,
@@ -92,18 +92,17 @@ if (token) {
     });
 
     socket.on('rejoinRoom', async ({ roomId, userId }: { roomId: string; userId: string }) => {
-  const room =await roomManager.rejoinRoom(roomId, userId, socket.id);
-  if (!room) {
-    socket.emit('rejoinFailed', { reason: 'Room no longer exists.' });
-    return;
-  }
-  socket.join(roomId);
-  // Send them the full current room state so they can restore
-  socket.emit('rejoinSuccess', room);
-  // Tell others this player is back
-  socket.to(roomId).emit('roomUpdate', room);
-});
+      const room = await roomManager.rejoinRoom(roomId, userId, socket.id);
+      if (!room) {
+        socket.emit('rejoinFailed', { reason: 'Room no longer exists.' });
+        return;
+      }
+      socket.join(roomId);
+      socket.emit('rejoinSuccess', room);
+      socket.to(roomId).emit('roomUpdate', room);
+    });
 
+    // ── Create room ───────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.CREATE_ROOM, (payload: CreateRoomPayload) => {
       const creator: Player = {
         userId: payload.userId,
@@ -113,7 +112,7 @@ if (token) {
         isDrawing: false,
         hasGuessedCorrectly: false,
         socketId: socket.id,
-         isConnected: true,
+        isConnected: true,
       };
 
       const room = roomManager.create({
@@ -131,7 +130,8 @@ if (token) {
       console.log(`[Socket] Room created: ${room.id}`);
     });
 
-    socket.on(SOCKET_EVENTS.JOIN_ROOM, (payload: JoinRoomPayload) => {
+    // ── Join room (pre-game AND mid-game) ─────────────────────────────────
+    socket.on(SOCKET_EVENTS.JOIN_ROOM, async (payload: JoinRoomPayload) => {
       const player: Player = {
         userId: payload.userId,
         name: payload.name,
@@ -140,14 +140,16 @@ if (token) {
         isDrawing: false,
         hasGuessedCorrectly: false,
         socketId: socket.id,
-         isConnected: true,
+        isConnected: true,
       };
 
-      const room = roomManager.addPlayer(payload.roomId, player);
-      if (!room) {
+      const result = roomManager.addPlayer(payload.roomId, player);
+      if (!result) {
         socket.emit(SOCKET_EVENTS.ERROR, 'Room not found or full');
         return;
       }
+
+      const { room, isMidGameJoin } = result;
 
       socket.join(room.id);
       currentRoomId = room.id;
@@ -155,9 +157,62 @@ if (token) {
       socket.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
       io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg(`${player.name} joined the room!`));
       broadcastLobby(io);
-      console.log(`[Socket] ${player.name} joined room ${room.id}`);
+      console.log(`[Socket] ${player.name} joined room ${room.id}${isMidGameJoin ? ' (mid-game)' : ''}`);
+
+      // ── Mid-game catch-up ──────────────────────────────────────────────
+      // Send the new joiner the current canvas, word hint and time remaining
+      // so they aren't staring at a blank canvas with no context.
+      if (isMidGameJoin) {
+        // 1. Immediately send whatever snapshot we have in Redis (may be a few
+        //    strokes behind — that's fine, we'll get a fresher one right after).
+        const cachedSnapshot = await roomManager.getSnapshot(room.id);
+
+        socket.emit(SOCKET_EVENTS.MID_GAME_JOIN_STATE, {
+          canvasSnapshot: cachedSnapshot,          // base64 PNG | null
+          wordHint: room.currentHint ?? '',        // current blanks/revealed letters
+          timeLeft: room.currentTimeLeft ?? 0,     // seconds remaining
+        });
+
+        // 2. Ask the drawer to send a fresh snapshot right now.
+        //    The drawer's client responds with CANVAS_SNAPSHOT which we store
+        //    and forward (see handler below).
+        if (room.currentDrawer) {
+          io.to(room.currentDrawer).emit(SOCKET_EVENTS.REQUEST_CANVAS_SNAPSHOT, {
+            roomId: room.id,
+            // Tag with the new joiner's socket so we can forward specifically to them
+            requestedBy: socket.id,
+          });
+        }
+      }
     });
 
+    // ── Canvas snapshot from drawer ───────────────────────────────────────
+    // Triggered by REQUEST_CANVAS_SNAPSHOT above (fresh snapshot on demand)
+    // OR by the stroke-end handler below (periodic background saves).
+    socket.on(
+      SOCKET_EVENTS.CANVAS_SNAPSHOT,
+      async ({ roomId, snapshot, requestedBy }: { roomId: string; snapshot: string; requestedBy?: string }) => {
+        const room = roomManager.get(roomId);
+        // Only accept snapshots from the current drawer
+        if (!room || room.currentDrawer !== socket.id) return;
+
+        // Persist to Redis (TTL is set inside saveSnapshot)
+        await roomManager.saveSnapshot(roomId, snapshot);
+
+        // If this was triggered by a specific mid-game joiner's request, forward
+        // the fresh snapshot directly to that player so they don't wait for the
+        // next periodic save.
+        if (requestedBy) {
+          io.to(requestedBy).emit(SOCKET_EVENTS.MID_GAME_JOIN_STATE, {
+            canvasSnapshot: snapshot,
+            wordHint: room.currentHint ?? '',
+            timeLeft: room.currentTimeLeft ?? 0,
+          });
+        }
+      }
+    );
+
+    // ── Leave room ────────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.LEAVE_ROOM, (roomId: string) => {
       const result = roomManager.removePlayer(socket.id);
       socket.leave(roomId);
@@ -171,6 +226,7 @@ if (token) {
       broadcastLobby(io);
     });
 
+    // ── Start game ────────────────────────────────────────────────────────
     socket.on('startGame', (roomId: string) => {
       const room = roomManager.startGame(roomId);
       if (!room) {
@@ -182,18 +238,33 @@ if (token) {
       startNewTurn(io, roomId);
     });
 
-    socket.on(SOCKET_EVENTS.DRAW, (payload: DrawPayload) => {
+    // ── Draw ──────────────────────────────────────────────────────────────
+    socket.on(SOCKET_EVENTS.DRAW, async (payload: DrawPayload) => {
+      // Relay to everyone else in the room
       socket.to(payload.roomId).emit(SOCKET_EVENTS.DRAW, payload.point);
+
+      // On stroke-end, ask the drawer for a fresh snapshot so Redis always
+      // has the latest canvas state ready for any mid-game joiners.
+      if (payload.point.type === 'end') {
+        socket.emit(SOCKET_EVENTS.REQUEST_CANVAS_SNAPSHOT, {
+          roomId: payload.roomId,
+          requestedBy: null, // background save — no one to forward to
+        });
+      }
     });
 
-    socket.on(SOCKET_EVENTS.CLEAR_CANVAS, (payload: ClearCanvasPayload) => {
+    // ── Clear canvas ──────────────────────────────────────────────────────
+    socket.on(SOCKET_EVENTS.CLEAR_CANVAS, async (payload: ClearCanvasPayload) => {
       const room = roomManager.get(payload.roomId);
       if (!room) return;
       if (room.currentDrawer === socket.id) {
         io.to(payload.roomId).emit(SOCKET_EVENTS.CLEAR_CANVAS);
+        // Wipe the stored snapshot — new joiners should see a blank canvas
+        await roomManager.clearSnapshot(payload.roomId);
       }
     });
 
+    // ── Chat ──────────────────────────────────────────────────────────────
     socket.on(
       SOCKET_EVENTS.SEND_MESSAGE,
       (payload: { roomId: string; message: string; playerName: string }) => {
@@ -208,6 +279,7 @@ if (token) {
       }
     );
 
+    // ── Guess ─────────────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.SEND_GUESS, async (payload: GuessPayload) => {
       const room = roomManager.get(payload.roomId);
       if (!room || !room.isPlaying) return;
@@ -244,28 +316,15 @@ if (token) {
       }
     });
 
-    // socket.on(SOCKET_EVENTS.DISCONNECT, () => {
-    //   console.log(`[Socket] Disconnected: ${socket.id}`);
-    //   const result = roomManager.removePlayer(socket.id);
-    //   if (result) {
-    //     const { room, wasDrawer } = result;
-    //     io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg('A player left the room.'));
-    //     io.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
-    //     if (wasDrawer && room.isPlaying) endTurn(io, room.id);
-    //   }
-    //   broadcastLobby(io);
-    // });
+    // ── Disconnect ────────────────────────────────────────────────────────
+    socket.on('disconnect', async () => {
+      console.log(`[Socket] Disconnected: ${socket.id}`);
+      if (!currentRoomId) return;
 
-
-socket.on('disconnect', async () => {
-  console.log(`[Socket] Disconnected: ${socket.id}`);
-  if (!currentRoomId) return;
-
-  await roomManager.markDisconnected(socket.id, currentRoomId);
-  socket.to(currentRoomId).emit('playerDisconnected', { socketId: socket.id });
-  broadcastLobby(io);
-});
-
+      await roomManager.markDisconnected(socket.id, currentRoomId);
+      socket.to(currentRoomId).emit('playerDisconnected', { socketId: socket.id });
+      broadcastLobby(io);
+    });
   });
 }
 
@@ -274,15 +333,15 @@ socket.on('disconnect', async () => {
 function startNewTurn(io: Server, roomId: string): void {
   endingTurns.delete(roomId);
 
+  // Clear the stored canvas snapshot — new turn = blank canvas
+  roomManager.clearSnapshot(roomId).catch(() => {});
+
   const result = roomManager.startTurn(roomId);
   if (!result) return;
 
   const { room, word, hint, drawer } = result;
 
-  // Send fresh room state so clients get updated currentDrawer + isDrawing flags
   io.to(roomId).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
-
-  // Tell the drawer their word first, then tell everyone the turn started
   io.to(drawer.socketId).emit(SOCKET_EVENTS.YOUR_TURN, { word });
 
   io.to(roomId).emit(SOCKET_EVENTS.NEW_TURN, {
@@ -298,16 +357,13 @@ function startNewTurn(io: Server, roomId: string): void {
     makeSystemMsg(`${drawer.name} is now drawing! Guess the word!`)
   );
 
-  // Build a mutable hint array — spaces pre-revealed, letters start as '_'
   const hintArr: string[] = word.split('').map((ch) => (ch === ' ' ? ' ' : '_'));
 
-  // Every 15 seconds reveal one random unrevealed letter to guessers
   const hintInterval = setInterval(() => {
     const hiddenIndices = hintArr
       .map((ch, i) => (ch === '_' ? i : -1))
       .filter((i) => i !== -1);
 
-    // Nothing left to reveal — stop the interval
     if (hiddenIndices.length === 0) {
       clearInterval(hintInterval);
       return;
@@ -315,15 +371,23 @@ function startNewTurn(io: Server, roomId: string): void {
 
     const pick = hiddenIndices[Math.floor(Math.random() * hiddenIndices.length)];
     hintArr[pick] = word[pick];
+    const newHint = hintArr.join(' ');
 
-    // Send updated hint to everyone except the drawer (they already know the word)
-    broadcastHint(io, roomId, drawer.socketId, hintArr.join(' '));
+    // Update the room's cached hint so mid-game joiners get the latest version
+    const r = roomManager.get(roomId);
+    if (r) r.currentHint = newHint;
+
+    broadcastHint(io, roomId, drawer.socketId, newHint);
   }, 15000);
 
-  // Countdown timer
   let timeLeft = room.drawTime;
   const countdownInterval = setInterval(() => {
     timeLeft -= 1;
+
+    // Keep the room's timeLeft in sync for mid-game joiners
+    const r = roomManager.get(roomId);
+    if (r) r.currentTimeLeft = timeLeft;
+
     io.to(roomId).emit(SOCKET_EVENTS.TIMER_UPDATE, timeLeft);
     if (timeLeft <= 0) {
       clearInterval(countdownInterval);
@@ -332,19 +396,19 @@ function startNewTurn(io: Server, roomId: string): void {
     }
   }, 1000);
 
-  // Store both so endTurn can cancel them early (e.g. all players guessed)
   roomManager.setIntervalRef(roomId, countdownInterval);
   roomManager.setHintIntervalRef(roomId, hintInterval);
 }
 
 function endTurn(io: Server, roomId: string): void {
-  // Guard: prevent double-fire from interval expiry + allGuessed racing
   if (endingTurns.has(roomId)) return;
   endingTurns.add(roomId);
 
-  // Cancel both the countdown and the hint reveal
   roomManager.clearIntervalRef(roomId);
   roomManager.clearHintIntervalRef(roomId);
+
+  // Clear the snapshot now that the turn is over
+  roomManager.clearSnapshot(roomId).catch(() => {});
 
   const room = roomManager.get(roomId);
   if (!room) {
@@ -384,7 +448,6 @@ function endTurn(io: Server, roomId: string): void {
       );
     }
   } else {
-    // 4 second pause so players can read the revealed word before next turn
     setTimeout(() => startNewTurn(io, roomId), 4000);
   }
 }

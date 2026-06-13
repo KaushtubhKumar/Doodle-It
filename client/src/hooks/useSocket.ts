@@ -1,4 +1,4 @@
-import { useEffect, useCallback } from 'react';
+import { useEffect, useCallback, useRef } from 'react';
 import { socket, connectSocket } from '../utils/socket';
 import { useGameStore } from '../context/gameStore';
 
@@ -37,7 +37,17 @@ const EVENTS = {
   START_GAME: 'startGame',
   SEND_MESSAGE: 'sendMessage',
   SEND_GUESS: 'sendGuess',
+  // Mid-game join
+  REQUEST_CANVAS_SNAPSHOT: 'requestCanvasSnapshot',
+  CANVAS_SNAPSHOT: 'canvasSnapshot',
+  MID_GAME_JOIN_STATE: 'midGameJoinState',
 } as const;
+
+interface MidGameJoinState {
+  canvasSnapshot: string | null;
+  wordHint: string;
+  timeLeft: number;
+}
 
 interface UseSocketReturn {
   getRooms: () => void;
@@ -59,16 +69,25 @@ interface UseSocketReturn {
   sendGuess: (roomId: string, guess: string, playerId: string, playerName: string) => void;
   onDraw: (cb: (point: DrawPoint) => void) => () => void;
   onClearCanvas: (cb: () => void) => () => void;
+  /** Called by DrawingCanvas when it receives REQUEST_CANVAS_SNAPSHOT */
+  sendSnapshot: (roomId: string, snapshot: string, requestedBy: string | null) => void;
+  /**
+   * Register a callback invoked when the server sends a mid-game canvas snapshot.
+   * DrawingCanvas uses this to paint the snapshot onto its canvas.
+   * Returns a cleanup function.
+   */
+  onRestoreSnapshot: (cb: (snapshot: string) => void) => () => void;
 }
 
 export function useSocket(): UseSocketReturn {
   const store = useGameStore();
 
+  // Stable ref so DrawingCanvas can always access the latest canvas
+  const snapshotCallbacksRef = useRef<Set<(snapshot: string) => void>>(new Set());
+
   useEffect(() => {
     connectSocket();
 
-    // Save our socket ID into the store as soon as we're connected
-    // so GamePage can reliably derive isDrawer without reading socket.id directly
     const onConnect = () => {
       store.setMySocketId(socket.id ?? '');
     };
@@ -87,41 +106,37 @@ export function useSocket(): UseSocketReturn {
       alert(`Socket error: ${msg}`);
     };
 
-socket.on('playerDisconnected', ({ socketId }: { socketId: string }) => {
-  const room = useGameStore.getState().room;
-  if (!room) return;
-  const updated = { ...room, players: room.players.map(p =>
-    p.socketId === socketId ? { ...p, isConnected: false } : p
-  )};
-  useGameStore.getState().updateRoom(updated);
-});
+    socket.on('playerDisconnected', ({ socketId }: { socketId: string }) => {
+      const room = useGameStore.getState().room;
+      if (!room) return;
+      const updated = { ...room, players: room.players.map(p =>
+        p.socketId === socketId ? { ...p, isConnected: false } : p
+      )};
+      useGameStore.getState().updateRoom(updated);
+    });
 
-socket.on('rejoinSuccess', (room: Room) => {
-  store.setRoom(room);
-  if (room.isPlaying) store.setPhase('drawing');
-});
+    socket.on('rejoinSuccess', (room: Room) => {
+      store.setRoom(room);
+      if (room.isPlaying) store.setPhase('drawing');
+    });
 
-socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
-  console.warn('Rejoin failed:', reason);
-});
+    socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
+      console.warn('Rejoin failed:', reason);
+    });
 
     // ── Game flow ────────────────────────────────────────────────────────
-    // GAME_STARTED: just update the room object — do NOT force phase to 'drawing'
-    // here. The phase transition happens on NEW_TURN so the drawer's word arrives
-    // in the same React render cycle as isDrawer becoming true.
     const onGameStarted = (room: Room) => {
       store.updateRoom(room);
       store.resetGame();
-      // Stay in 'waiting' phase — NEW_TURN will move us to 'drawing'
     };
 
     const onNewTurn = (info: TurnInfo) => {
-      store.setTurnInfo(info); // this sets phase → 'drawing' and clears myWord
+      store.setTurnInfo(info);
       store.clearPendingPoints();
     };
 
     const onYourTurn = ({ word }: { word: string }) => {
-      store.setMyWord(word); // arrives right after NEW_TURN from server
+      store.setMyWord(word);
     };
 
     const onWordHint = (hint: string) => store.setWordHint(hint);
@@ -134,6 +149,41 @@ socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
     };
     const onGameEnded = (info: GameEndInfo) => store.setWinner(info.winner, info.players);
     const onNewMessage = (msg: ChatMessage) => store.addMessage(msg);
+
+    // ── Mid-game join: catch-up packet received ───────────────────────────
+    // Received when we joined a room that's already in-progress, OR when the
+    // drawer responds to REQUEST_CANVAS_SNAPSHOT with a fresh canvas PNG.
+    const onMidGameJoinState = ({ canvasSnapshot, wordHint, timeLeft }: MidGameJoinState) => {
+      // Update hint and timer in the store so the UI shows correct values
+      if (wordHint) store.setWordHint(wordHint);
+      if (timeLeft) store.setTimeLeft(timeLeft);
+
+      // Make sure the game phase is correct
+      store.setPhase('drawing');
+
+      // Deliver snapshot to DrawingCanvas via the registered callbacks
+      if (canvasSnapshot) {
+        snapshotCallbacksRef.current.forEach(cb => cb(canvasSnapshot));
+      }
+    };
+
+    // ── Mid-game join: server asks THIS client (drawer) for a snapshot ────
+    // The server emits REQUEST_CANVAS_SNAPSHOT when a new player joins mid-game.
+    // We can't access the canvas DOM from here, so we use a CustomEvent to
+    // bridge into DrawingCanvas which then calls sendSnapshot().
+    const onRequestCanvasSnapshot = ({
+      roomId,
+      requestedBy,
+    }: {
+      roomId: string;
+      requestedBy: string | null;
+    }) => {
+      window.dispatchEvent(
+        new CustomEvent('doodle:requestSnapshot', {
+          detail: { roomId, requestedBy },
+        })
+      );
+    };
 
     socket.on(EVENTS.ROOMS_LIST, onRoomsList);
     socket.on(EVENTS.ROOM_CREATED, onRoomCreated);
@@ -150,6 +200,8 @@ socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
     socket.on(EVENTS.TURN_ENDED, onTurnEnded);
     socket.on(EVENTS.GAME_ENDED, onGameEnded);
     socket.on(EVENTS.NEW_MESSAGE, onNewMessage);
+    socket.on(EVENTS.MID_GAME_JOIN_STATE, onMidGameJoinState);
+    socket.on(EVENTS.REQUEST_CANVAS_SNAPSHOT, onRequestCanvasSnapshot);
 
     return () => {
       socket.off('connect', onConnect);
@@ -168,9 +220,10 @@ socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
       socket.off(EVENTS.TURN_ENDED, onTurnEnded);
       socket.off(EVENTS.GAME_ENDED, onGameEnded);
       socket.off(EVENTS.NEW_MESSAGE, onNewMessage);
+      socket.off(EVENTS.MID_GAME_JOIN_STATE, onMidGameJoinState);
+      socket.off(EVENTS.REQUEST_CANVAS_SNAPSHOT, onRequestCanvasSnapshot);
       socket.off('rejoinSuccess');
       socket.off('rejoinFailed');
-      // No disconnectSocket() — socket stays alive across re-renders
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -242,6 +295,26 @@ socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
     return () => { socket.off(EVENTS.CLEAR_CANVAS, cb); };
   }, []);
 
+  /**
+   * Called by DrawingCanvas after it receives the doodle:requestSnapshot DOM event.
+   * Sends the canvas PNG back to the server which forwards it to the new joiner.
+   */
+  const sendSnapshot = useCallback(
+    (roomId: string, snapshot: string, requestedBy: string | null) => {
+      socket.emit(EVENTS.CANVAS_SNAPSHOT, { roomId, snapshot, requestedBy });
+    },
+    []
+  );
+
+  /**
+   * DrawingCanvas calls this once to register a callback that receives snapshot
+   * data URLs whenever a MID_GAME_JOIN_STATE packet arrives.
+   */
+  const onRestoreSnapshot = useCallback((cb: (snapshot: string) => void) => {
+    snapshotCallbacksRef.current.add(cb);
+    return () => { snapshotCallbacksRef.current.delete(cb); };
+  }, []);
+
   return {
     getRooms,
     createRoom,
@@ -254,5 +327,7 @@ socket.on('rejoinFailed', ({ reason }: { reason: string }) => {
     sendGuess,
     onDraw,
     onClearCanvas,
+    sendSnapshot,
+    onRestoreSnapshot,
   };
 }

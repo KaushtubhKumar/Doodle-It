@@ -47,7 +47,7 @@ class RoomManager {
       isPlaying: false,
     };
     this.rooms.set(id, room);
-    redis.set(`player:${opts.creatorPlayer.userId}:room`, id, 'EX', 7200).catch(() => {}); // ADD
+    redis.set(`player:${opts.creatorPlayer.userId}:room`, id, 'EX', 7200).catch(() => {});
     return room;
   }
 
@@ -65,25 +65,37 @@ class RoomManager {
     this.rooms.delete(roomId);
   }
 
-  addPlayer(roomId: string, player: Player): Room | null {
+  /**
+   * addPlayer now accepts mid-game joins.
+   * Returns { room, isMidGameJoin } so the JOIN_ROOM handler
+   * knows whether to send the MID_GAME_JOIN_STATE catch-up packet.
+   */
+  addPlayer(
+    roomId: string,
+    player: Player
+  ): { room: Room; isMidGameJoin: boolean } | null {
     const room = this.rooms.get(roomId);
     if (!room) return null;
     if (room.players.length >= room.maxPlayers) return null;
-    if (room.players.find((p) => p.socketId === player.socketId)) return room;
+    if (room.players.find((p) => p.socketId === player.socketId)) {
+      return { room, isMidGameJoin: false };
+    }
+
+    const isMidGameJoin = room.isPlaying;
+
     room.players.push(player);
 
     // Persist userId → roomId so rejoin works across restarts
     redis.set(`player:${player.userId}:room`, room.id, 'EX', 7200).catch(() => {});
-    return room;
+    return { room, isMidGameJoin };
   }
 
   removePlayer(socketId: string): { room: Room; wasDrawer: boolean } | null {
     for (const room of this.rooms.values()) {
       const idx = room.players.findIndex((p) => p.socketId === socketId);
       if (idx !== -1) {
-                // Clear Redis entry on intentional leave
-        const player = room.players[idx]; // grab before splice — adjust: splice mutates so grab first
-        redis.del(`player:${player.userId}:room`).catch(() => {});       
+        const player = room.players[idx];
+        redis.del(`player:${player.userId}:room`).catch(() => {});
 
         const wasDrawer = room.currentDrawer === socketId;
         room.players.splice(idx, 1);
@@ -141,7 +153,11 @@ class RoomManager {
     const word = getRandomWord();
     room.currentWord = word;
 
-    return { room, word, hint: buildHint(word), drawer };
+    const hint = buildHint(word);
+    room.currentHint = hint;
+    room.currentTimeLeft = room.drawTime;
+
+    return { room, word, hint, drawer };
   }
 
   checkGuess(
@@ -223,70 +239,86 @@ class RoomManager {
   setTimer(_roomId: string, _cb: () => void, _ms: number): void {}
   clearTimer(_roomId: string): void {}
 
-  // ── Reconnection support ──────────────────────────────────────────────────
+  // ── Canvas snapshot (Redis, TTL = drawTime + 30s buffer) ──────────────
+  //
+  // We store the latest base64 PNG snapshot in Redis so:
+  //   1. It survives across multiple Node processes (multi-server deploy).
+  //   2. It auto-expires after the turn ends — no manual cleanup needed.
 
-// Track disconnected players: socketId → { roomId, playerId, timer }
-private disconnected = new Map<string, { roomId: string; playerId: string; timer: ReturnType<typeof setTimeout> }>();
+  async saveSnapshot(roomId: string, snapshot: string): Promise<void> {
+    const room = this.rooms.get(roomId);
+    const ttl = (room?.drawTime ?? 120) + 30;
+    await redis.set(`canvas:${roomId}:snapshot`, snapshot, 'EX', ttl).catch(() => {});
+  }
 
-async markDisconnected(socketId: string, roomId: string): Promise<void> {
-  const room = this.rooms.get(roomId);
-  if (!room) return;
+  async getSnapshot(roomId: string): Promise<string | null> {
+    return redis.get(`canvas:${roomId}:snapshot`).catch(() => null);
+  }
 
-  const player = room.players.find(p => p.socketId === socketId);
-  if (!player) return;
+  async clearSnapshot(roomId: string): Promise<void> {
+    await redis.del(`canvas:${roomId}:snapshot`).catch(() => {});
+  }
 
-  player.isConnected = false;
+  // ── Reconnection support ──────────────────────────────────────────────
 
-  // Store in Redis with 35s TTL (5s buffer over the 30s hold window)
-  await redis.set(
-    `disconnected:${player.userId}`,
-    JSON.stringify({ roomId, socketId }),
-    'EX', 35
-  ).catch(() => {});
+  private disconnected = new Map<string, { roomId: string; playerId: string; timer: ReturnType<typeof setTimeout> }>();
 
-  // Still use local setTimeout to trigger removal — Redis TTL is just the backup
-  const timer = setTimeout(() => {
-    this.forceRemovePlayer(roomId, socketId);
-    redis.del(`disconnected:${player.userId}`).catch(() => {});
-  }, 30_000);
+  async markDisconnected(socketId: string, roomId: string): Promise<void> {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
 
-  this.disconnected.set(socketId, { roomId, playerId: player.userId, timer });
-}
+    const player = room.players.find(p => p.socketId === socketId);
+    if (!player) return;
 
-async rejoinRoom(roomId: string, playerId: string, newSocketId: string): Promise<Room | null> {
-  const room = this.rooms.get(roomId);
-  if (!room) return null;
+    player.isConnected = false;
 
-  const player = room.players.find(p => p.userId === playerId);
-  
-  // Player still in room (within 30s window) — just update their socket
-  if (player) {
-    const held = [...this.disconnected.values()]
-      .find(d => d.playerId === playerId && d.roomId === roomId);
-    if (held) {
-      clearTimeout(held.timer);
-      for (const [sid, d] of this.disconnected) {
-        if (d.playerId === playerId) { this.disconnected.delete(sid); break; }
+    await redis.set(
+      `disconnected:${player.userId}`,
+      JSON.stringify({ roomId, socketId }),
+      'EX', 35
+    ).catch(() => {});
+
+    const timer = setTimeout(() => {
+      this.forceRemovePlayer(roomId, socketId);
+      redis.del(`disconnected:${player.userId}`).catch(() => {});
+    }, 30_000);
+
+    this.disconnected.set(socketId, { roomId, playerId: player.userId, timer });
+  }
+
+  async rejoinRoom(roomId: string, playerId: string, newSocketId: string): Promise<Room | null> {
+    const room = this.rooms.get(roomId);
+    if (!room) return null;
+
+    const player = room.players.find(p => p.userId === playerId);
+
+    if (player) {
+      const held = [...this.disconnected.values()]
+        .find(d => d.playerId === playerId && d.roomId === roomId);
+      if (held) {
+        clearTimeout(held.timer);
+        for (const [sid, d] of this.disconnected) {
+          if (d.playerId === playerId) { this.disconnected.delete(sid); break; }
+        }
       }
+      await redis.del(`disconnected:${playerId}`).catch(() => {});
+      player.socketId    = newSocketId;
+      player.isConnected = true;
+      return room;
     }
-    await redis.del(`disconnected:${playerId}`).catch(() => {});
-    player.socketId    = newSocketId;
-    player.isConnected = true;
-    return room;
+
+    return null;
   }
 
-  // Player was already removed (30s expired) — cannot rejoin mid-game
-  return null;
-}
-private forceRemovePlayer(roomId: string, socketId: string): void {
-  const room = this.rooms.get(roomId);
-  if (!room) return;
-  room.players = room.players.filter(p => p.socketId !== socketId);
-  if (room.players.length === 0) {
-    this.rooms.delete(roomId);
+  private forceRemovePlayer(roomId: string, socketId: string): void {
+    const room = this.rooms.get(roomId);
+    if (!room) return;
+    room.players = room.players.filter(p => p.socketId !== socketId);
+    if (room.players.length === 0) {
+      this.rooms.delete(roomId);
+    }
+    this.disconnected.delete(socketId);
   }
-  this.disconnected.delete(socketId);
-}
 }
 
 export const roomManager = new RoomManager();
