@@ -9,6 +9,18 @@ interface Props {
   onClearCanvas: (roomId: string) => void;
   subscribeToDrawEvents: (cb: (point: DrawPoint) => void) => () => void;
   subscribeToClearEvents: (cb: () => void) => () => void;
+  /**
+   * Called by this component when the server requests a canvas snapshot
+   * (mid-game join: a new player just entered while we're drawing).
+   * Only the current drawer needs to handle this.
+   */
+  onSendSnapshot: (roomId: string, snapshot: string, requestedBy: string | null) => void;
+  /**
+   * Register a callback that fires whenever a canvas snapshot arrives
+   * from the server (mid-game join: we just entered a game in progress).
+   * Returns a cleanup function.
+   */
+  onRestoreSnapshot: (cb: (snapshot: string) => void) => () => void;
 }
 
 const COLORS = [
@@ -27,6 +39,8 @@ export const DrawingCanvas: React.FC<Props> = ({
   onClearCanvas,
   subscribeToDrawEvents,
   subscribeToClearEvents,
+  onSendSnapshot,
+  onRestoreSnapshot,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const isDrawingRef = useRef(false);
@@ -82,6 +96,55 @@ export const DrawingCanvas: React.FC<Props> = ({
     clearCanvasLocal();
   }, [clearCanvasLocal]);
 
+  // ── Restore snapshot (mid-game join: we just arrived mid-turn) ────────
+  // When the server sends us a canvas snapshot we paint it onto the canvas
+  // via drawImage so we immediately see what has been drawn so far.
+
+  useEffect(() => {
+    const unsubRestore = onRestoreSnapshot((snapshot: string) => {
+      const canvas = canvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      if (!canvas || !ctx) return;
+
+      const img = new Image();
+      img.onload = () => {
+        // Draw the snapshot over the current canvas (server already cleared
+        // on turn start, so this is the only content we need)
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+      };
+      img.src = snapshot;
+    });
+    return unsubRestore;
+  }, [onRestoreSnapshot]);
+
+  // ── Snapshot request (mid-game join: a new player just joined while we draw) ──
+  // The server sends REQUEST_CANVAS_SNAPSHOT → useSocket fires
+  // the doodle:requestSnapshot DOM event → we capture the canvas here.
+  // Only the current drawer should respond.
+
+  useEffect(() => {
+    if (!isDrawer) return;
+
+    const handleRequest = (e: Event) => {
+      const { roomId: reqRoomId, requestedBy } = (e as CustomEvent<{
+        roomId: string;
+        requestedBy: string | null;
+      }>).detail;
+
+      if (reqRoomId !== roomId) return;
+
+      const canvas = canvasRef.current;
+      if (!canvas) return;
+
+      // Compress to JPEG at 0.7 quality — keeps the base64 small (~50-150 KB)
+      const snapshot = canvas.toDataURL('image/jpeg', 0.7);
+      onSendSnapshot(roomId, snapshot, requestedBy);
+    };
+
+    window.addEventListener('doodle:requestSnapshot', handleRequest);
+    return () => window.removeEventListener('doodle:requestSnapshot', handleRequest);
+  }, [isDrawer, roomId, onSendSnapshot]);
+
   // ── Mouse event helpers ───────────────────────────────────────────────
 
   const getPos = (
@@ -108,18 +171,15 @@ export const DrawingCanvas: React.FC<Props> = ({
   const throttledNetworkDraw = useRef(
     throttle((id: string, pt: DrawPoint, drawCb: typeof onDraw) => {
       drawCb(id, pt);
-    }, 30) // 30ms = ~33 network events per second
+    }, 30)
   ).current;
 
- const emitPoint = useCallback(
+  const emitPoint = useCallback(
     (type: DrawPoint['type'], x: number, y: number) => {
       const point: DrawPoint = { x, y, color, strokeWidth, type };
-      
-      // 1. Draw locally IMMEDIATELY so the user experiences zero lag
-      drawPoint(point); 
-      
-      // 2. Throttle the network emission to the server
-      // We always send 'start' and 'end' events immediately, only throttle 'draw'
+
+      drawPoint(point);
+
       if (type === 'start' || type === 'end') {
         onDraw(roomId, point);
       } else {

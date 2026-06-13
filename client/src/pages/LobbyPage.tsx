@@ -26,7 +26,7 @@ export const LobbyPage: React.FC = () => {
     drawTime: 80,
   });
 
-  // Poll lobby every 5s
+  // Poll lobby every 2s
   useEffect(() => {
     getRooms();
     const interval = setInterval(getRooms, 2000);
@@ -53,8 +53,12 @@ export const LobbyPage: React.FC = () => {
     setShowCreate(false);
   };
 
+  // ── Join handler (works for both pre-game and mid-game) ───────────────
+  // Previously this had `if (r.isPlaying) return` — that guard is now removed
+  // so players can join in-progress rooms. The server handles mid-game catch-up.
   const handleJoinRoom = (r: LobbyRoom) => {
-    if (!user || r.isPlaying) return;
+    if (!user) return;
+    if (r.players >= r.maxPlayers) return; // still block full rooms
     joinRoom(r.id, user._id, user.name, user.profilePic);
   };
 
@@ -113,41 +117,54 @@ export const LobbyPage: React.FC = () => {
           </div>
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {lobbyRooms.map((r) => (
-              <div
-                key={r.id}
-                className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden hover:shadow-md transition-shadow"
-              >
-                <div className="p-4">
-                  <div className="flex items-start justify-between mb-3">
-                    <h3 className="font-semibold text-gray-800 truncate">{r.name}</h3>
-                    <span
-                      className={`text-xs px-2 py-0.5 rounded-full font-medium ml-2 flex-shrink-0 ${
-                        r.isPlaying
-                          ? 'bg-red-100 text-red-600'
-                          : 'bg-green-100 text-green-600'
+            {lobbyRooms.map((r) => {
+              const isFull = r.players >= r.maxPlayers;
+              const canJoin = !isFull;
+
+              return (
+                <div
+                  key={r.id}
+                  className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden hover:shadow-md transition-shadow"
+                >
+                  <div className="p-4">
+                    <div className="flex items-start justify-between mb-3">
+                      <h3 className="font-semibold text-gray-800 truncate">{r.name}</h3>
+                      <span
+                        className={`text-xs px-2 py-0.5 rounded-full font-medium ml-2 flex-shrink-0 ${
+                          r.isPlaying
+                            ? 'bg-orange-100 text-orange-600'
+                            : 'bg-green-100 text-green-600'
+                        }`}
+                      >
+                        {r.isPlaying ? '🟠 In Progress' : '🟢 Open'}
+                      </span>
+                    </div>
+                    <div className="text-sm text-gray-500 space-y-1">
+                      <p>👥 {r.players}/{r.maxPlayers} players</p>
+                      <p>🔄 {r.rounds} rounds · ⏱ {r.drawTime}s</p>
+                      <p className="font-mono text-xs text-gray-400">#{r.id}</p>
+                    </div>
+                  </div>
+                  <div className="px-4 pb-4">
+                    <button
+                      onClick={() => handleJoinRoom(r)}
+                      disabled={!canJoin}
+                      className={`w-full py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                        r.isPlaying && canJoin
+                          ? 'bg-orange-500 text-white hover:bg-orange-600'
+                          : 'bg-blue-500 text-white hover:bg-blue-600'
                       }`}
                     >
-                      {r.isPlaying ? '🔴 In Progress' : '🟢 Open'}
-                    </span>
-                  </div>
-                  <div className="text-sm text-gray-500 space-y-1">
-                    <p>👥 {r.players}/{r.maxPlayers} players</p>
-                    <p>🔄 {r.rounds} rounds · ⏱ {r.drawTime}s</p>
-                    <p className="font-mono text-xs text-gray-400">#{r.id}</p>
+                      {isFull
+                        ? 'Full'
+                        : r.isPlaying
+                        ? '⚡ Join Mid-Game'
+                        : 'Join Room'}
+                    </button>
                   </div>
                 </div>
-                <div className="px-4 pb-4">
-                  <button
-                    onClick={() => handleJoinRoom(r)}
-                    disabled={r.isPlaying || r.players >= r.maxPlayers}
-                    className="w-full py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed bg-blue-500 text-white hover:bg-blue-600"
-                  >
-                    {r.isPlaying ? 'Game in Progress' : r.players >= r.maxPlayers ? 'Full' : 'Join Room'}
-                  </button>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

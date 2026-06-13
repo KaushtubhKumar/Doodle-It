@@ -41,6 +41,8 @@ export const GamePage: React.FC = () => {
     sendGuess,
     onDraw,
     onClearCanvas,
+    sendSnapshot,
+    onRestoreSnapshot,
   } = useSocket();
 
   useEffect(() => {
@@ -170,6 +172,8 @@ export const GamePage: React.FC = () => {
                   onClearCanvas={clearCanvas}
                   subscribeToDrawEvents={onDraw}
                   subscribeToClearEvents={onClearCanvas}
+                  onSendSnapshot={sendSnapshot}
+                  onRestoreSnapshot={onRestoreSnapshot}
                 />
               </div>
 
