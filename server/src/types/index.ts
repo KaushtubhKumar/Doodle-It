@@ -33,6 +33,13 @@ export interface Room {
   isPlaying: boolean;
   currentWord?: string;
   currentDrawer?: string; // socketId
+
+  // ── Mid-game join support ──────────────────────────────────────
+  // These are NOT sent to clients in their raw form — they are
+  // only used server-side and stripped when broadcasting roomUpdate.
+  // They are stored here so handlers.ts can access them in one place.
+  currentHint?: string;        // latest revealed hint string, e.g. "_ _ _ _"
+  currentTimeLeft?: number;    // seconds remaining in current turn
 }
 
 export interface DrawPoint {
@@ -135,6 +142,14 @@ export const SOCKET_EVENTS = {
   SEND_MESSAGE: 'sendMessage',
   NEW_MESSAGE: 'newMessage',
   SEND_GUESS: 'sendGuess',
+
+  // ── Mid-game join ─────────────────────────────────────────────
+  // Server → drawer: "please send me your canvas as base64"
+  REQUEST_CANVAS_SNAPSHOT: 'requestCanvasSnapshot',
+  // Drawer → server: base64 PNG snapshot of current canvas
+  CANVAS_SNAPSHOT: 'canvasSnapshot',
+  // Server → new joiner: catch-up package (snapshot + hint + timeLeft)
+  MID_GAME_JOIN_STATE: 'midGameJoinState',
 } as const;
 
 export type SocketEventName = typeof SOCKET_EVENTS[keyof typeof SOCKET_EVENTS];
