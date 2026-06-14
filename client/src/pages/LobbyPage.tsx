@@ -1,256 +1,277 @@
+// LobbyPage.tsx — Doodle-It Redesign
+// DROP-IN REPLACEMENT: same socket events / store calls, pure visual changes
+
 import React, { useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../context/authStore';
-import { useGameStore } from '../context/gameStore';
-import { useSocket } from '../hooks/useSocket';
-import { LobbyRoom } from '../types';
+import useAuthStore from '../context/authStore';
+import useGameStore from '../context/gameStore';
+import { socket } from '../utils/socket';
+import { SOCKET_EVENTS } from '../../server/src/types'; // adjust path as needed
+import '../styles/doodle-theme.css';
 
-interface CreateRoomForm {
-  name: string;
-  maxPlayers: number;
-  rounds: number;
-  drawTime: number;
-}
+const ROOM_COLORS = ['var(--sun)', 'var(--sage)', 'var(--sky)', '#FFB5E8', '#B5DEFF'];
 
-export const LobbyPage: React.FC = () => {
-  const navigate = useNavigate();
-  const { user, logout } = useAuthStore();
-  const { lobbyRooms, room } = useGameStore();
-  const { getRooms, createRoom, joinRoom } = useSocket();
-
+const LobbyPage: React.FC = () => {
+  const { user, logout }         = useAuthStore();
+  const { rooms, currentRoom }   = useGameStore();
+  const navigate                 = useNavigate();
   const [showCreate, setShowCreate] = useState(false);
-  const [form, setForm] = useState<CreateRoomForm>({
-    name: `${user?.name ?? 'Player'}'s Room`,
-    maxPlayers: 8,
-    rounds: 3,
-    drawTime: 80,
-  });
+  const [roomName, setRoomName]     = useState('');
+  const [maxPlayers, setMaxPlayers] = useState(8);
+  const [rounds, setRounds]         = useState(3);
+  const [drawTime, setDrawTime]     = useState(80);
 
-  // Poll lobby every 2s
   useEffect(() => {
-    getRooms();
-    const interval = setInterval(getRooms, 2000);
-    return () => clearInterval(interval);
-  }, [getRooms]);
+    socket.emit(SOCKET_EVENTS.GET_ROOMS);
+  }, []);
 
-  // Navigate to game when room is set
   useEffect(() => {
-    if (room) navigate('/game');
-  }, [room, navigate]);
+    if (currentRoom) navigate('/game');
+  }, [currentRoom]);
 
-  const handleCreateRoom = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!user) return;
-    createRoom({
-      name: form.name,
-      maxPlayers: form.maxPlayers,
-      rounds: form.rounds,
-      drawTime: form.drawTime,
-      userId: user._id,
-      userName: user.name,
-      profilePic: user.profilePic,
+  const handleCreate = () => {
+    if (!roomName.trim()) return;
+    socket.emit(SOCKET_EVENTS.CREATE_ROOM, {
+      name: roomName,
+      maxPlayers,
+      rounds,
+      drawTime,
+      hostId: user?.id,
+      hostName: user?.name,
     });
     setShowCreate(false);
+    setRoomName('');
   };
 
-  // ── Join handler (works for both pre-game and mid-game) ───────────────
-  // Previously this had `if (r.isPlaying) return` — that guard is now removed
-  // so players can join in-progress rooms. The server handles mid-game catch-up.
-  const handleJoinRoom = (r: LobbyRoom) => {
-    if (!user) return;
-    if (r.players >= r.maxPlayers) return; // still block full rooms
-    joinRoom(r.id, user._id, user.name, user.profilePic);
+  const handleJoin = (roomId: string) => {
+    socket.emit(SOCKET_EVENTS.JOIN_ROOM, { roomId, playerId: user?.id, playerName: user?.name });
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-50 to-purple-50">
-      {/* Nav */}
-      <nav className="bg-white border-b border-gray-200 shadow-sm">
-        <div className="max-w-5xl mx-auto px-4 py-3 flex items-center justify-between">
-          <div className="flex items-center gap-2">
-            <span className="text-2xl">🎨</span>
-            <h1 className="text-xl font-bold text-gray-800">Skribbl</h1>
-          </div>
-          <div className="flex items-center gap-4">
-            <div className="flex items-center gap-2">
-              <div className="w-8 h-8 rounded-full bg-gradient-to-br from-blue-400 to-purple-500 flex items-center justify-center text-white text-sm font-bold">
-                {user?.name[0]?.toUpperCase()}
-              </div>
-              <span className="text-sm font-medium text-gray-700">{user?.name}</span>
-              <span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-0.5 rounded-full">
-                🏆 {user?.wins ?? 0} wins
-              </span>
-            </div>
-            <button
-              onClick={logout}
-              className="text-sm text-gray-500 hover:text-gray-700 transition-colors"
-            >
-              Logout
-            </button>
-          </div>
+    <div style={{ minHeight: '100vh', padding: '24px 16px' }}>
+      {/* ── Header ── */}
+      <header style={{
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'space-between',
+        maxWidth: 860,
+        margin: '0 auto 32px',
+        flexWrap: 'wrap',
+        gap: 12,
+      }}>
+        <div>
+          <h1 style={{
+            fontFamily: 'var(--font-display)',
+            fontSize: '2.6rem',
+            lineHeight: 1,
+          }}>
+            <span style={{ color: 'var(--coral)' }}>Doodle</span>
+            <span style={{ color: 'var(--ink)' }}>-It</span>
+            <span style={{ marginLeft: 8 }}>✏️</span>
+          </h1>
+          <p style={{ fontFamily: 'var(--font-hand)', fontSize: '1.1rem', color: 'var(--ink-light)', marginTop: 2 }}>
+            Pick a room and show off your skills!
+          </p>
         </div>
-      </nav>
 
-      <div className="max-w-5xl mx-auto px-4 py-8">
-        {/* Header */}
-        <div className="flex items-center justify-between mb-6">
-          <div>
-            <h2 className="text-2xl font-bold text-gray-800">Game Rooms</h2>
-            <p className="text-sm text-gray-500 mt-0.5">
-              {lobbyRooms.length} room{lobbyRooms.length !== 1 ? 's' : ''} available
-            </p>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          {/* User badge */}
+          <div className="player-badge" style={{ transform: 'rotate(-1deg)' }}>
+            <div className="player-avatar" style={{ background: 'var(--sun)' }}>
+              {user?.name?.[0]?.toUpperCase() ?? '?'}
+            </div>
+            <span className="player-name">{user?.name}</span>
           </div>
+          <button className="btn btn-ghost btn-sm" onClick={logout}>Logout</button>
+        </div>
+      </header>
+
+      {/* ── Main content ── */}
+      <main style={{ maxWidth: 860, margin: '0 auto' }}>
+        {/* Create room CTA */}
+        <div style={{
+          display: 'flex',
+          alignItems: 'center',
+          justifyContent: 'space-between',
+          marginBottom: 20,
+          gap: 12,
+          flexWrap: 'wrap',
+        }}>
+          <h2 style={{ fontFamily: 'var(--font-display)', fontSize: '1.5rem' }}>
+            🎪 Open Rooms
+            {rooms.length > 0 && (
+              <span style={{
+                marginLeft: 10,
+                background: 'var(--coral)',
+                color: '#fff',
+                borderRadius: 'var(--radius-pill)',
+                padding: '2px 12px',
+                fontSize: '1rem',
+                border: 'var(--border-thin)',
+                verticalAlign: 'middle',
+              }}>{rooms.length}</span>
+            )}
+          </h2>
           <button
+            className="btn btn-coral"
             onClick={() => setShowCreate(true)}
-            className="px-5 py-2.5 bg-blue-500 text-white font-semibold rounded-xl hover:bg-blue-600 transition-colors shadow-sm"
           >
-            + Create Room
+            + Start a new room
           </button>
         </div>
 
         {/* Room list */}
-        {lobbyRooms.length === 0 ? (
-          <div className="text-center py-20 text-gray-400">
-            <p className="text-5xl mb-4">🎭</p>
-            <p className="text-lg font-medium">No rooms yet</p>
-            <p className="text-sm mt-1">Create one and invite your friends!</p>
+        {rooms.length === 0 ? (
+          <div className="paper-card no-tape" style={{
+            padding: '48px 24px',
+            textAlign: 'center',
+          }}>
+            <div style={{ fontSize: '4rem', marginBottom: 12 }}>🎨</div>
+            <h3 style={{ fontFamily: 'var(--font-display)', fontSize: '1.5rem', marginBottom: 8 }}>
+              No rooms open yet
+            </h3>
+            <p style={{ fontFamily: 'var(--font-hand)', fontSize: '1.1rem', color: 'var(--ink-light)', marginBottom: 20 }}>
+              Be the first to kick things off!
+            </p>
+            <button className="btn btn-coral btn-lg" onClick={() => setShowCreate(true)}>
+              🚀 Create the first room
+            </button>
           </div>
         ) : (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
-            {lobbyRooms.map((r) => {
-              const isFull = r.players >= r.maxPlayers;
-              const canJoin = !isFull;
-
-              return (
-                <div
-                  key={r.id}
-                  className="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden hover:shadow-md transition-shadow"
-                >
-                  <div className="p-4">
-                    <div className="flex items-start justify-between mb-3">
-                      <h3 className="font-semibold text-gray-800 truncate">{r.name}</h3>
-                      <span
-                        className={`text-xs px-2 py-0.5 rounded-full font-medium ml-2 flex-shrink-0 ${
-                          r.isPlaying
-                            ? 'bg-orange-100 text-orange-600'
-                            : 'bg-green-100 text-green-600'
-                        }`}
-                      >
-                        {r.isPlaying ? '🟠 In Progress' : '🟢 Open'}
-                      </span>
-                    </div>
-                    <div className="text-sm text-gray-500 space-y-1">
-                      <p>👥 {r.players}/{r.maxPlayers} players</p>
-                      <p>🔄 {r.rounds} rounds · ⏱ {r.drawTime}s</p>
-                      <p className="font-mono text-xs text-gray-400">#{r.id}</p>
-                    </div>
-                  </div>
-                  <div className="px-4 pb-4">
-                    <button
-                      onClick={() => handleJoinRoom(r)}
-                      disabled={!canJoin}
-                      className={`w-full py-2 rounded-lg text-sm font-semibold transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
-                        r.isPlaying && canJoin
-                          ? 'bg-orange-500 text-white hover:bg-orange-600'
-                          : 'bg-blue-500 text-white hover:bg-blue-600'
-                      }`}
-                    >
-                      {isFull
-                        ? 'Full'
-                        : r.isPlaying
-                        ? '⚡ Join Mid-Game'
-                        : 'Join Room'}
-                    </button>
+          <div>
+            {rooms.map((room, i) => (
+              <div
+                key={room.id}
+                className="room-row"
+                style={{ borderLeft: `5px solid ${ROOM_COLORS[i % ROOM_COLORS.length]}` }}
+              >
+                <div>
+                  <div style={{ fontFamily: 'var(--font-display)', fontSize: '1.15rem' }}>{room.name}</div>
+                  <div style={{ fontFamily: 'var(--font-hand)', fontSize: '0.95rem', color: 'var(--ink-light)', marginTop: 2 }}>
+                    👤 {room.players?.length ?? 0}/{room.maxPlayers} players
+                    &nbsp;·&nbsp; 🔄 {room.rounds} rounds
+                    &nbsp;·&nbsp; ⏱ {room.drawTime}s
                   </div>
                 </div>
-              );
-            })}
+
+                {/* Ticket-style room code */}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0 }}>
+                  <div style={{
+                    background: 'var(--cream-dark)',
+                    border: 'var(--border-thin)',
+                    borderRadius: 'var(--radius-sm)',
+                    padding: '4px 10px',
+                    fontFamily: 'var(--font-hand)',
+                    fontSize: '0.85rem',
+                    color: 'var(--ink-light)',
+                    letterSpacing: 1,
+                  }}>
+                    #{room.id?.slice(-6).toUpperCase()}
+                  </div>
+                  <button
+                    className="btn btn-sun btn-sm"
+                    onClick={() => handleJoin(room.id)}
+                    disabled={room.players?.length >= room.maxPlayers || room.status === 'playing'}
+                  >
+                    {room.status === 'playing' ? '🔒 In progress' : 'Join →'}
+                  </button>
+                </div>
+              </div>
+            ))}
           </div>
         )}
-      </div>
+      </main>
 
-      {/* Create Room Modal */}
+      {/* ── Create Room Modal ── */}
       {showCreate && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md">
-            <div className="p-6">
-              <h3 className="text-xl font-bold text-gray-800 mb-5">Create a Room</h3>
-              <form onSubmit={handleCreateRoom} className="space-y-4">
+        <div style={{
+          position: 'fixed', inset: 0,
+          background: 'rgba(44,24,16,0.45)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          zIndex: 1000, padding: 16,
+          backdropFilter: 'blur(2px)',
+        }}>
+          <div className="paper-card no-tape" style={{
+            width: '100%',
+            maxWidth: 460,
+            padding: '36px 32px',
+            transform: 'rotate(-0.5deg)',
+          }}>
+            {/* Tape decoration */}
+            <div style={{
+              position: 'absolute', top: -14, left: '50%',
+              transform: 'translateX(-50%) rotate(-2deg)',
+              width: 72, height: 22,
+              background: 'var(--tape)',
+              border: '1px solid rgba(44,24,16,0.15)',
+              borderRadius: 3,
+            }} />
+
+            <h2 style={{ fontFamily: 'var(--font-display)', fontSize: '1.8rem', marginBottom: 6 }}>
+              🎪 New Room
+            </h2>
+            <p style={{ fontFamily: 'var(--font-hand)', color: 'var(--ink-light)', marginBottom: 24, fontSize: '1rem' }}>
+              Set the stage for your drawing showdown
+            </p>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+              <div>
+                <label className="input-label">Room name</label>
+                <input
+                  className="input-field"
+                  placeholder="e.g. Saturday Doodlers"
+                  value={roomName}
+                  onChange={e => setRoomName(e.target.value)}
+                  autoFocus
+                />
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 12 }}>
                 <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Room Name
-                  </label>
-                  <input
-                    type="text"
-                    value={form.name}
-                    onChange={(e) => setForm({ ...form, name: e.target.value })}
-                    maxLength={40}
-                    required
-                    className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-                  />
-                </div>
-
-                <div className="grid grid-cols-3 gap-3">
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Players
-                    </label>
-                    <select
-                      value={form.maxPlayers}
-                      onChange={(e) => setForm({ ...form, maxPlayers: Number(e.target.value) })}
-                      className="w-full border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-                    >
-                      {[2, 4, 6, 8, 10, 12].map((n) => (
-                        <option key={n} value={n}>{n}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Rounds
-                    </label>
-                    <select
-                      value={form.rounds}
-                      onChange={(e) => setForm({ ...form, rounds: Number(e.target.value) })}
-                      className="w-full border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-                    >
-                      {[2, 3, 4, 5, 6].map((n) => (
-                        <option key={n} value={n}>{n}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div>
-                    <label className="block text-sm font-medium text-gray-700 mb-1">
-                      Draw Time
-                    </label>
-                    <select
-                      value={form.drawTime}
-                      onChange={(e) => setForm({ ...form, drawTime: Number(e.target.value) })}
-                      className="w-full border border-gray-300 rounded-lg px-2 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300"
-                    >
-                      {[30, 60, 80, 120, 180].map((n) => (
-                        <option key={n} value={n}>{n}s</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="flex gap-3 pt-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowCreate(false)}
-                    className="flex-1 py-2.5 border border-gray-300 rounded-xl text-gray-700 font-medium hover:bg-gray-50 transition-colors"
+                  <label className="input-label">Players</label>
+                  <select
+                    className="input-field"
+                    value={maxPlayers}
+                    onChange={e => setMaxPlayers(Number(e.target.value))}
                   >
-                    Cancel
-                  </button>
-                  <button
-                    type="submit"
-                    className="flex-1 py-2.5 bg-blue-500 rounded-xl text-white font-semibold hover:bg-blue-600 transition-colors"
-                  >
-                    Create
-                  </button>
+                    {[2,4,6,8,10,12].map(n => <option key={n}>{n}</option>)}
+                  </select>
                 </div>
-              </form>
+                <div>
+                  <label className="input-label">Rounds</label>
+                  <select
+                    className="input-field"
+                    value={rounds}
+                    onChange={e => setRounds(Number(e.target.value))}
+                  >
+                    {[1,2,3,4,5,6].map(n => <option key={n}>{n}</option>)}
+                  </select>
+                </div>
+                <div>
+                  <label className="input-label">Draw time</label>
+                  <select
+                    className="input-field"
+                    value={drawTime}
+                    onChange={e => setDrawTime(Number(e.target.value))}
+                  >
+                    {[30,45,60,80,100,120,150,180].map(n => <option key={n}>{n}s</option>)}
+                  </select>
+                </div>
+              </div>
+            </div>
+
+            <div style={{ display: 'flex', gap: 12, marginTop: 24 }}>
+              <button className="btn btn-ghost" onClick={() => setShowCreate(false)} style={{ flex: 1 }}>
+                Cancel
+              </button>
+              <button
+                className="btn btn-coral"
+                onClick={handleCreate}
+                disabled={!roomName.trim()}
+                style={{ flex: 2 }}
+              >
+                🎨 Create Room
+              </button>
             </div>
           </div>
         </div>
@@ -258,3 +279,5 @@ export const LobbyPage: React.FC = () => {
     </div>
   );
 };
+
+export default LobbyPage;

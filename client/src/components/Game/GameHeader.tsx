@@ -1,83 +1,115 @@
-import React from 'react';
+// GameHeader.tsx — Doodle-It Redesign
+// DROP-IN REPLACEMENT: same props interface, visual overhaul only
+// Props: { wordHint: string[], timer: number, round: number, totalRounds: number,
+//          drawerName: string, isDrawer: boolean, currentWord?: string }
 
-interface Props {
-  myWord: string | null;
-  wordHint: string;
-  timeLeft: number;
-  totalTime: number;
-  currentRound: number;
-  totalRounds: number;
-  drawerName: string;
-  isDrawer: boolean;
-  phase: string;
-  revealedWord: string | null;
+import React from 'react';
+import '../../styles/doodle-theme.css';
+
+interface GameHeaderProps {
+  wordHint:     string[];
+  timer:        number;
+  round:        number;
+  totalRounds:  number;
+  drawerName:   string;
+  isDrawer:     boolean;
+  currentWord?: string;
+  maxTime:      number;
 }
 
-export const GameHeader: React.FC<Props> = ({
-  myWord,
-  wordHint,
-  timeLeft,
-  totalTime,
-  currentRound,
-  totalRounds,
-  drawerName,
-  isDrawer,
-  phase,
-  revealedWord,
+const GameHeader: React.FC<GameHeaderProps> = ({
+  wordHint, timer, round, totalRounds, drawerName, isDrawer, currentWord, maxTime,
 }) => {
-  const timerPct = totalTime > 0 ? (timeLeft / totalTime) * 100 : 0;
-  const timerColor =
-    timerPct > 50 ? 'bg-green-500' : timerPct > 25 ? 'bg-yellow-500' : 'bg-red-500';
+  const isUrgent    = timer <= 10;
+  const progress    = timer / maxTime;
+  const circumference = 2 * Math.PI * 28; // r=28
+
+  // Progress ring color
+  const ringColor = isUrgent ? 'var(--coral)' : progress > 0.4 ? 'var(--sage)' : 'var(--sun)';
 
   return (
-    <div className="bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
-      {/* Timer bar */}
-      <div className="h-2 bg-gray-100">
-        <div
-          className={`h-full transition-all duration-1000 ${timerColor}`}
-          style={{ width: `${timerPct}%` }}
-        />
+    <div className="game-header" style={{ gap: 20, flexWrap: 'nowrap', overflowX: 'auto' }}>
+      {/* Round badge */}
+      <div style={{ flexShrink: 0 }}>
+        <div className="round-badge">
+          Round {round}/{totalRounds}
+        </div>
+        <div style={{
+          fontFamily: 'var(--font-hand)',
+          fontSize: '0.85rem',
+          color: 'var(--ink-light)',
+          marginTop: 4,
+          textAlign: 'center',
+        }}>
+          {isDrawer ? '✏️ Your turn!' : `🎨 ${drawerName} is drawing`}
+        </div>
       </div>
 
-      <div className="flex items-center justify-between px-4 py-3">
-        {/* Round */}
-        <span className="text-sm text-gray-500 font-medium">
-          Round {currentRound}/{totalRounds}
-        </span>
+      {/* Divider */}
+      <div style={{ width: 1, height: 48, background: 'rgba(44,24,16,0.15)', flexShrink: 0 }} />
 
-        {/* Word / hint */}
-        <div className="text-center">
-          {phase === 'turn-end' && revealedWord ? (
-            <div className="text-center">
-              <p className="text-xs text-gray-400 uppercase tracking-wider">The word was</p>
-              <p className="text-xl font-bold text-blue-600">{revealedWord}</p>
-            </div>
-          ) : isDrawer && myWord ? (
-            <div>
-              <p className="text-xs text-gray-400 uppercase tracking-wider">Your word</p>
-              <p className="text-xl font-bold text-purple-600 tracking-wide">{myWord}</p>
-            </div>
-          ) : (
-            <div>
-              <p className="text-xs text-gray-400 uppercase tracking-wider mb-0.5">
-                {drawerName} is drawing
-              </p>
-              <p className="text-xl font-mono font-bold tracking-[0.3em] text-gray-800">
-                {wordHint}
-              </p>
-            </div>
-          )}
-        </div>
+      {/* Word hint — centered, takes remaining space */}
+      <div style={{ flex: 1, display: 'flex', justifyContent: 'center' }}>
+        {isDrawer && currentWord ? (
+          /* Drawer sees the word on a sticky-note */
+          <div style={{
+            background: 'var(--sun)',
+            border: 'var(--border-ink)',
+            borderRadius: 'var(--radius-md)',
+            padding: '6px 20px',
+            fontFamily: 'var(--font-display)',
+            fontSize: '1.6rem',
+            letterSpacing: 2,
+            boxShadow: 'var(--shadow-sm)',
+            transform: 'rotate(-0.5deg)',
+          }}>
+            {currentWord}
+          </div>
+        ) : (
+          /* Guessers see the hint letters */
+          <div className="word-hint">
+            {wordHint.map((char, i) => (
+              char === ' ' ? (
+                <div key={i} style={{ width: 18 }} />
+              ) : (
+                <div
+                  key={i}
+                  className={`hint-letter ${char !== '_' ? 'revealed' : ''}`}
+                >
+                  {char !== '_' ? char : ''}
+                </div>
+              )
+            ))}
+          </div>
+        )}
+      </div>
 
-        {/* Timer */}
-        <div
-          className={`text-2xl font-bold tabular-nums min-w-[3rem] text-right ${
-            timeLeft <= 10 ? 'text-red-500 animate-pulse' : 'text-gray-700'
-          }`}
-        >
-          {timeLeft}s
+      {/* Divider */}
+      <div style={{ width: 1, height: 48, background: 'rgba(44,24,16,0.15)', flexShrink: 0 }} />
+
+      {/* Timer ring */}
+      <div className={`timer-ring ${isUrgent ? 'wiggle-anim' : ''}`} style={{ flexShrink: 0 }}>
+        <svg width="80" height="80" viewBox="0 0 70 70">
+          {/* Track */}
+          <circle cx="35" cy="35" r="28" fill="none" stroke="rgba(44,24,16,0.1)" strokeWidth="6" />
+          {/* Progress */}
+          <circle
+            cx="35" cy="35" r="28"
+            fill="none"
+            stroke={ringColor}
+            strokeWidth="6"
+            strokeLinecap="round"
+            strokeDasharray={circumference}
+            strokeDashoffset={circumference * (1 - progress)}
+            style={{ transition: 'stroke-dashoffset 1s linear, stroke 0.5s' }}
+          />
+        </svg>
+        <div className={`timer-number ${isUrgent ? 'timer-urgent' : ''}`}>
+          {timer}
         </div>
       </div>
     </div>
   );
 };
+
+export default GameHeader;

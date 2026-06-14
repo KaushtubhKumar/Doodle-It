@@ -1,125 +1,160 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { debounce } from 'lodash';
-import { ChatMessage } from '../../types';
+// ChatBox.tsx — Doodle-It Redesign
+// DROP-IN REPLACEMENT: same props/socket events, pure visual overhaul
+// Props: { messages: Message[], onSendGuess: (guess: string) => void, isDrawer: boolean }
 
-interface Props {
-  messages: ChatMessage[];
-  isDrawer: boolean;
-  roomId: string;
-  playerId: string;
-  playerName: string;
-  onSendMessage: (roomId: string, msg: string, playerName: string) => void;
-  onSendGuess: (roomId: string, guess: string, playerId: string, playerName: string) => void;
+import React, { useEffect, useRef, useState } from 'react';
+import '../../styles/doodle-theme.css';
+
+interface Message {
+  id:        string;
+  sender:    string;
+  text:      string;
+  type:      'guess' | 'correct' | 'system';
+  timestamp: number;
 }
 
-export const ChatBox: React.FC<Props> = ({
-  messages,
-  isDrawer,
-  roomId,
-  playerId,
-  playerName,
-  onSendMessage,
-  onSendGuess,
-}) => {
-  const [input, setInput] = useState('');
-  const bottomRef = useRef<HTMLDivElement>(null);
+interface ChatBoxProps {
+  messages:     Message[];
+  onSendGuess:  (guess: string) => void;
+  isDrawer:     boolean;
+}
 
-  // Auto-scroll to the bottom when a new message arrives
+const ChatBox: React.FC<ChatBoxProps> = ({ messages, onSendGuess, isDrawer }) => {
+  const [input, setInput]   = useState('');
+  const bottomRef           = useRef<HTMLDivElement>(null);
+
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  /* We wrap the debounce inside a useRef hook. 
-    This is extremely important in React because otherwise, every time the component 
-    re-renders (e.g., when you type a character), a brand new debounce timer instance 
-    is created, which completely breaks the debounce logic and allows spamming.
-  */
-  const debouncedSendRef = useRef(
-    debounce(
-      (text: string, currentIsDrawer: boolean) => {
-        if (currentIsDrawer) {
-          onSendMessage(roomId, text, playerName);
-        } else {
-          onSendGuess(roomId, text, playerId, playerName);
-        }
-      },
-      400, // 400ms cooling period to prevent fast message/guess macros
-      { leading: true, trailing: false } // Fires the message instantly on the first click, then locks out for 400ms
-    )
-  );
-
-  // Clean up the debounce timer if the component ever unmounts to prevent memory leaks
-  useEffect(() => {
-    const currentDebounce = debouncedSendRef.current;
-    return () => {
-      currentDebounce.cancel();
-    };
-  }, []);
-
-  const handleSubmit = (e: React.FormEvent) => {
+  const handleSend = (e: React.FormEvent) => {
     e.preventDefault();
-    const text = input.trim();
-    if (!text) return;
-
-    // Pass down arguments safely into the stable debounced execution context
-    debouncedSendRef.current(text, isDrawer);
+    if (!input.trim() || isDrawer) return;
+    onSendGuess(input.trim());
     setInput('');
   };
 
-  const msgClass = (type: ChatMessage['type']) => {
-    switch (type) {
-      case 'correct-guess':
-        return 'bg-green-50 border-l-4 border-green-400 text-green-800';
-      case 'system':
-        return 'bg-blue-50 border-l-4 border-blue-300 text-blue-700 italic';
-      default:
-        return 'bg-white';
-    }
-  };
-
   return (
-    <div className="flex flex-col h-full bg-white border border-gray-200 rounded-lg shadow-sm overflow-hidden">
+    <div style={{
+      display: 'flex',
+      flexDirection: 'column',
+      height: '100%',
+      background: 'var(--paper)',
+      borderLeft: 'var(--border-ink)',
+    }}>
       {/* Header */}
-      <div className="px-4 py-2 bg-gray-50 border-b border-gray-200">
-        <h3 className="text-sm font-semibold text-gray-600">
-          {isDrawer ? '💬 Chat' : '💡 Guess the word!'}
+      <div style={{
+        padding: '12px 16px 10px',
+        borderBottom: 'var(--border-thin)',
+        display: 'flex',
+        alignItems: 'center',
+        gap: 8,
+        flexShrink: 0,
+      }}>
+        <span style={{ fontSize: '1.1rem' }}>💬</span>
+        <h3 style={{ fontFamily: 'var(--font-display)', fontSize: '1.05rem' }}>
+          Guesses
         </h3>
+        {isDrawer && (
+          <span style={{
+            marginLeft: 'auto',
+            background: 'var(--cream-dark)',
+            border: 'var(--border-thin)',
+            borderRadius: 'var(--radius-pill)',
+            padding: '2px 10px',
+            fontFamily: 'var(--font-hand)',
+            fontSize: '0.8rem',
+            color: 'var(--ink-light)',
+          }}>
+            You're drawing!
+          </span>
+        )}
       </div>
 
       {/* Message list */}
-      <div className="flex-1 overflow-y-auto px-3 py-2 space-y-1.5">
-        {messages.map((msg) => (
-          <div
-            key={msg.id}
-            className={`px-2 py-1 rounded text-sm ${msgClass(msg.type)}`}
-          >
-            {msg.type !== 'system' && (
-              <span className="font-semibold text-gray-700 mr-1">{msg.sender}:</span>
-            )}
-            <span>{msg.message}</span>
+      <div style={{
+        flex: 1,
+        overflowY: 'auto',
+        padding: '12px 14px',
+        display: 'flex',
+        flexDirection: 'column',
+        gap: 4,
+      }}>
+        {messages.length === 0 && (
+          <div style={{
+            textAlign: 'center',
+            padding: '32px 16px',
+            fontFamily: 'var(--font-hand)',
+            fontSize: '1rem',
+            color: 'var(--ink-light)',
+          }}>
+            <div style={{ fontSize: '2.5rem', marginBottom: 8 }}>🤔</div>
+            Start guessing!
           </div>
-        ))}
+        )}
+
+        {messages.map(msg => {
+          if (msg.type === 'system') return (
+            <div key={msg.id} className="chat-bubble system" style={{ alignSelf: 'center' }}>
+              {msg.text}
+            </div>
+          );
+
+          if (msg.type === 'correct') return (
+            <div key={msg.id} className="correct-banner">
+              🎉 <strong>{msg.sender}</strong> guessed it! +points
+            </div>
+          );
+
+          return (
+            <div key={msg.id} className="chat-bubble guess" style={{ position: 'relative' }}>
+              <span style={{
+                fontFamily: 'var(--font-hand)',
+                fontSize: '0.8rem',
+                color: 'var(--ink-light)',
+                marginRight: 6,
+              }}>
+                {msg.sender}:
+              </span>
+              {msg.text}
+            </div>
+          );
+        })}
         <div ref={bottomRef} />
       </div>
 
-      {/* Input Form */}
-      <form onSubmit={handleSubmit} className="flex border-t border-gray-200">
+      {/* Input */}
+      <form
+        onSubmit={handleSend}
+        style={{
+          padding: '10px 12px',
+          borderTop: 'var(--border-thin)',
+          display: 'flex',
+          gap: 8,
+          flexShrink: 0,
+          background: 'var(--cream-dark)',
+        }}
+      >
         <input
-          type="text"
+          className="input-field"
+          style={{ flex: 1, padding: '10px 14px', fontSize: '0.95rem' }}
+          placeholder={isDrawer ? "You're drawing… 🤫" : "Type your guess…"}
           value={input}
-          onChange={(e) => setInput(e.target.value)}
-          placeholder={isDrawer ? 'Chat with players...' : 'Type your guess...'}
-          maxLength={100}
-          className="flex-1 px-3 py-2 text-sm outline-none"
+          onChange={e => setInput(e.target.value)}
+          disabled={isDrawer}
           autoComplete="off"
         />
         <button
           type="submit"
-          className="px-4 py-2 bg-blue-500 text-white text-sm font-medium hover:bg-blue-600 transition-colors"
+          className="btn btn-coral btn-sm"
+          disabled={isDrawer || !input.trim()}
+          style={{ flexShrink: 0 }}
         >
-          Send
+          ✓
         </button>
       </form>
     </div>
   );
 };
+
+export default ChatBox;

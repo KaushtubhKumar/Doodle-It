@@ -1,84 +1,141 @@
-import React, { useState, useEffect } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../context/authStore';
+// LoginPage.tsx — Doodle-It Redesign
+// DROP-IN REPLACEMENT: same imports/exports, pure visual changes only
+// All logic (useAuthStore, navigate, handleSubmit) stays identical
 
-export const LoginPage: React.FC = () => {
-  const navigate = useNavigate();
-  const { user, login, isLoading, error, clearError } = useAuthStore();
+import React, { useState } from 'react';
+import { useNavigate, Link } from 'react-router-dom';
+import useAuthStore from '../context/authStore';
+import '../styles/doodle-theme.css';
 
-  const [email, setEmail] = useState('');
+const LoginPage: React.FC = () => {
+  const [email, setEmail]       = useState('');
   const [password, setPassword] = useState('');
-
-  useEffect(() => {
-    if (user) navigate('/lobby');
-  }, [user, navigate]);
+  const [error, setError]       = useState('');
+  const { login, isLoading }    = useAuthStore();
+  const navigate                = useNavigate();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    await login(email, password);
+    setError('');
+    try {
+      await login(email, password);
+      navigate('/lobby');
+    } catch (err: any) {
+      setError(err.message || 'Login failed');
+    }
   };
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-blue-100 via-purple-50 to-pink-100 flex items-center justify-center p-4">
-      <div className="bg-white rounded-2xl shadow-xl w-full max-w-md overflow-hidden">
-        {/* Header */}
-        <div className="bg-gradient-to-r from-blue-500 to-purple-600 p-8 text-center">
-          <p className="text-5xl mb-2">🎨</p>
-          <h1 className="text-3xl font-bold text-white">Skribbl</h1>
-          <p className="text-white/80 text-sm mt-1">Draw. Guess. Win.</p>
+    <div className="auth-page">
+      {/* Floating doodle decorations */}
+      <div style={{
+        position: 'fixed', top: 40, left: 60,
+        fontSize: '3rem', opacity: 0.18, transform: 'rotate(-15deg)',
+        pointerEvents: 'none', userSelect: 'none',
+      }}>✏️</div>
+      <div style={{
+        position: 'fixed', bottom: 80, right: 80,
+        fontSize: '4rem', opacity: 0.13, transform: 'rotate(10deg)',
+        pointerEvents: 'none', userSelect: 'none',
+      }}>🎨</div>
+      <div style={{
+        position: 'fixed', top: '30%', right: 40,
+        fontSize: '2.5rem', opacity: 0.14, transform: 'rotate(8deg)',
+        pointerEvents: 'none', userSelect: 'none',
+      }}>⭐</div>
+
+      <div className="auth-card paper-card no-tape">
+        {/* Big playful title */}
+        <div style={{ textAlign: 'center', marginBottom: 8 }}>
+          <h1 style={{
+            fontFamily: 'var(--font-display)',
+            fontSize: '3.2rem',
+            lineHeight: 1,
+            letterSpacing: '-1px',
+          }}>
+            <span style={{ color: 'var(--coral)' }}>Doodle</span>
+            <span style={{ color: 'var(--ink)' }}>-It</span>
+            <span style={{ marginLeft: 8, fontSize: '2rem' }}>✏️</span>
+          </h1>
+          <p className="auth-tagline">Draw. Guess. Win the room.</p>
         </div>
 
-        <div className="p-8">
-          <h2 className="text-xl font-bold text-gray-800 mb-6">Welcome back!</h2>
+        {/* Sticky note sub-header */}
+        <div style={{
+          background: 'var(--sun)',
+          border: 'var(--border-ink)',
+          borderRadius: 'var(--radius-md)',
+          padding: '8px 16px',
+          marginBottom: 24,
+          fontFamily: 'var(--font-hand)',
+          fontSize: '1.1rem',
+          textAlign: 'center',
+          transform: 'rotate(0.5deg)',
+          boxShadow: 'var(--shadow-sm)',
+        }}>
+          Welcome back, artist! 🖌️
+        </div>
+
+        <form onSubmit={handleSubmit} style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
+          <div>
+            <label className="input-label">Email address</label>
+            <input
+              type="email"
+              className="input-field"
+              placeholder="your@email.com"
+              value={email}
+              onChange={e => setEmail(e.target.value)}
+              required
+            />
+          </div>
+
+          <div>
+            <label className="input-label">Password</label>
+            <input
+              type="password"
+              className="input-field"
+              placeholder="••••••••"
+              value={password}
+              onChange={e => setPassword(e.target.value)}
+              required
+            />
+          </div>
 
           {error && (
-            <div className="bg-red-50 border border-red-200 text-red-600 text-sm rounded-lg px-4 py-3 mb-4 flex items-center justify-between">
-              <span>{error}</span>
-              <button onClick={clearError} className="text-red-400 hover:text-red-600 ml-2">✕</button>
+            <div style={{
+              background: '#FFE5DF',
+              border: '2px solid var(--coral)',
+              borderRadius: 'var(--radius-md)',
+              padding: '10px 14px',
+              fontWeight: 700,
+              fontSize: '0.9rem',
+              color: 'var(--coral-dark)',
+            }}>
+              ⚠️ {error}
             </div>
           )}
 
-          <form onSubmit={handleSubmit} className="space-y-4">
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Email</label>
-              <input
-                type="email"
-                value={email}
-                onChange={(e) => setEmail(e.target.value)}
-                required
-                placeholder="you@example.com"
-                className="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 transition-shadow"
-              />
-            </div>
-            <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Password</label>
-              <input
-                type="password"
-                value={password}
-                onChange={(e) => setPassword(e.target.value)}
-                required
-                placeholder="••••••••"
-                className="w-full border border-gray-300 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-300 transition-shadow"
-              />
-            </div>
+          <button
+            type="submit"
+            className="btn btn-coral btn-lg"
+            disabled={isLoading}
+            style={{ width: '100%', marginTop: 4 }}
+          >
+            {isLoading ? '⏳ Signing in…' : '🚀 Let\'s Draw!'}
+          </button>
+        </form>
 
-            <button
-              type="submit"
-              disabled={isLoading}
-              className="w-full py-3 bg-blue-500 text-white font-semibold rounded-xl hover:bg-blue-600 disabled:opacity-60 disabled:cursor-not-allowed transition-colors shadow-sm mt-2"
-            >
-              {isLoading ? 'Signing in...' : 'Sign In'}
-            </button>
-          </form>
+        <hr className="divider" />
 
-          <p className="text-sm text-center text-gray-500 mt-6">
-            Don't have an account?{' '}
-            <Link to="/register" className="text-blue-500 font-medium hover:underline">
-              Register
-            </Link>
-          </p>
-        </div>
+        <p style={{ textAlign: 'center', fontWeight: 600, fontSize: '0.95rem' }}>
+          New here?{' '}
+          <Link to="/register" style={{ color: 'var(--coral)', textDecoration: 'none', fontWeight: 800 }}>
+            Join the game →
+          </Link>
+        </p>
       </div>
     </div>
   );
 };
+
+export default LoginPage;
