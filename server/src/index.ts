@@ -5,7 +5,8 @@ import { Server } from 'socket.io';
 import cors from 'cors';
 import mongoose from 'mongoose';
 import rateLimit from 'express-rate-limit';
-
+import { createAdapter } from '@socket.io/redis-adapter';
+import { redis } from './utils/redis';
 import authRoutes from './routes/auth';
 import { registerSocketHandlers } from './socket/handlers';
 
@@ -22,6 +23,10 @@ const CLIENT_URL = process.env.CLIENT_URL ?? 'http://localhost:5173';
 const io = new Server(httpServer, {
   cors: { origin: CLIENT_URL, methods: ['GET', 'POST'], credentials: true },
 });
+
+const pubClient = redis;
+const subClient = redis.duplicate();
+io.adapter(createAdapter(pubClient, subClient));
 
 // ── Middleware ──────────────────────────────────────────────────────────────
 app.use(cors({ origin: CLIENT_URL, credentials: true }));
