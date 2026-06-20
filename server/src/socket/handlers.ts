@@ -23,8 +23,8 @@ const makeSystemMsg = (message: string): ChatMessage => ({
   timestamp: Date.now(),
 });
 
-function broadcastLobby(io: Server): void {
-  const allRooms = roomManager.getAll().map((r) => ({
+async function broadcastLobby(io: Server): Promise<void> {
+  const allRooms = (await roomManager.getAll()).map((r) => ({
     id: r.id,
     name: r.name,
     players: r.players.length,
@@ -46,9 +46,6 @@ function broadcastHint(io: Server, roomId: string, drawerSocketId: string, hint:
   }
 }
 
-// Prevents endTurn double-fire (interval expiry + allGuessed racing)
-const endingTurns = new Set<string>();
-
 export function registerSocketHandlers(io: Server): void {
   io.on('connection', async (socket: Socket) => {
     console.log(`[Socket] Connected: ${socket.id}`);
@@ -59,15 +56,36 @@ export function registerSocketHandlers(io: Server): void {
     const token = socket.handshake.auth?.token as string | undefined;
     if (token) {
       try {
-        const decoded = jwt.verify(token, process.env.JWT_SECRET!) as { id: string };
+        const decoded = jwt.verify(token, process.env.JWT_SECRET!) as {
+          id: string;
+        };
         const roomId = await redis.get(`player:${decoded.id}:room`);
         if (roomId) {
-          const room = await roomManager.rejoinRoom(roomId, decoded.id, socket.id);
+          const room = await roomManager.rejoinRoom(
+            roomId,
+            decoded.id,
+            socket.id,
+          );
           if (room) {
             socket.join(roomId);
             currentRoomId = roomId;
-            socket.emit('rejoinSuccess', room);
-            socket.to(roomId).emit('roomUpdate', room);
+            socket.emit("rejoinSuccess", room);
+            socket.to(roomId).emit("roomUpdate", room);
+
+            if (room.isPlaying) {
+              const cachedSnapshot = await roomManager.getSnapshot(room.id);
+              socket.emit(SOCKET_EVENTS.MID_GAME_JOIN_STATE, {
+                canvasSnapshot: cachedSnapshot,
+                wordHint: room.currentHint ?? "",
+                timeLeft: room.currentTimeLeft ?? 0,
+              });
+              const rejoiningPlayer = room.players.find(p => p.socketId === socket.id);
+              if (rejoiningPlayer && room.currentDrawer === socket.id) {
+                socket.emit(SOCKET_EVENTS.YOUR_TURN, {
+                  word: room.currentWord,
+                });
+              }
+            }
           } else {
             await redis.del(`player:${decoded.id}:room`);
           }
@@ -78,8 +96,8 @@ export function registerSocketHandlers(io: Server): void {
     }
 
     // ── Lobby ─────────────────────────────────────────────────────────────
-    socket.on(SOCKET_EVENTS.GET_ROOMS, () => {
-      const rooms = roomManager.getAll().map((r) => ({
+    socket.on(SOCKET_EVENTS.GET_ROOMS, async () => {
+      const rooms = (await roomManager.getAll()).map((r) => ({
         id: r.id,
         name: r.name,
         players: r.players.length,
@@ -100,10 +118,22 @@ export function registerSocketHandlers(io: Server): void {
       socket.join(roomId);
       socket.emit('rejoinSuccess', room);
       socket.to(roomId).emit('roomUpdate', room);
+
+      if (room.isPlaying) {
+        const cachedSnapshot = await roomManager.getSnapshot(room.id);
+        socket.emit(SOCKET_EVENTS.MID_GAME_JOIN_STATE, {
+          canvasSnapshot: cachedSnapshot,
+          wordHint: room.currentHint ?? "",
+          timeLeft: room.currentTimeLeft ?? 0,
+        });
+        if (room.currentDrawer === socket.id) {
+          socket.emit(SOCKET_EVENTS.YOUR_TURN, { word: room.currentWord });
+        }
+      }
     });
 
     // ── Create room ───────────────────────────────────────────────────────
-    socket.on(SOCKET_EVENTS.CREATE_ROOM, (payload: CreateRoomPayload) => {
+    socket.on(SOCKET_EVENTS.CREATE_ROOM, async (payload: CreateRoomPayload) => {
       const creator: Player = {
         userId: payload.userId,
         name: payload.userName,
@@ -115,7 +145,7 @@ export function registerSocketHandlers(io: Server): void {
         isConnected: true,
       };
 
-      const room = roomManager.create({
+      const room = await roomManager.create({
         name: payload.name,
         maxPlayers: payload.maxPlayers,
         rounds: payload.rounds,
@@ -126,7 +156,7 @@ export function registerSocketHandlers(io: Server): void {
       socket.join(room.id);
       currentRoomId = room.id;
       socket.emit(SOCKET_EVENTS.ROOM_CREATED, room);
-      broadcastLobby(io);
+      await broadcastLobby(io);
       console.log(`[Socket] Room created: ${room.id}`);
     });
 
@@ -143,7 +173,7 @@ export function registerSocketHandlers(io: Server): void {
         isConnected: true,
       };
 
-      const result = roomManager.addPlayer(payload.roomId, player);
+      const result = await roomManager.addPlayer(payload.roomId, player);
       if (!result) {
         socket.emit(SOCKET_EVENTS.ERROR, 'Room not found or full');
         return;
@@ -156,30 +186,22 @@ export function registerSocketHandlers(io: Server): void {
       socket.emit(SOCKET_EVENTS.ROOM_JOINED, room);
       socket.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
       io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg(`${player.name} joined the room!`));
-      broadcastLobby(io);
+      await broadcastLobby(io);
       console.log(`[Socket] ${player.name} joined room ${room.id}${isMidGameJoin ? ' (mid-game)' : ''}`);
 
       // ── Mid-game catch-up ──────────────────────────────────────────────
-      // Send the new joiner the current canvas, word hint and time remaining
-      // so they aren't staring at a blank canvas with no context.
       if (isMidGameJoin) {
-        // 1. Immediately send whatever snapshot we have in Redis (may be a few
-        //    strokes behind — that's fine, we'll get a fresher one right after).
         const cachedSnapshot = await roomManager.getSnapshot(room.id);
 
         socket.emit(SOCKET_EVENTS.MID_GAME_JOIN_STATE, {
-          canvasSnapshot: cachedSnapshot,          // base64 PNG | null
-          wordHint: room.currentHint ?? '',        // current blanks/revealed letters
-          timeLeft: room.currentTimeLeft ?? 0,     // seconds remaining
+          canvasSnapshot: cachedSnapshot,
+          wordHint: room.currentHint ?? '',
+          timeLeft: room.currentTimeLeft ?? 0,
         });
 
-        // 2. Ask the drawer to send a fresh snapshot right now.
-        //    The drawer's client responds with CANVAS_SNAPSHOT which we store
-        //    and forward (see handler below).
         if (room.currentDrawer) {
           io.to(room.currentDrawer).emit(SOCKET_EVENTS.REQUEST_CANVAS_SNAPSHOT, {
             roomId: room.id,
-            // Tag with the new joiner's socket so we can forward specifically to them
             requestedBy: socket.id,
           });
         }
@@ -187,21 +209,14 @@ export function registerSocketHandlers(io: Server): void {
     });
 
     // ── Canvas snapshot from drawer ───────────────────────────────────────
-    // Triggered by REQUEST_CANVAS_SNAPSHOT above (fresh snapshot on demand)
-    // OR by the stroke-end handler below (periodic background saves).
     socket.on(
       SOCKET_EVENTS.CANVAS_SNAPSHOT,
       async ({ roomId, snapshot, requestedBy }: { roomId: string; snapshot: string; requestedBy?: string }) => {
-        const room = roomManager.get(roomId);
-        // Only accept snapshots from the current drawer
+        const room = await roomManager.get(roomId);
         if (!room || room.currentDrawer !== socket.id) return;
 
-        // Persist to Redis (TTL is set inside saveSnapshot)
         await roomManager.saveSnapshot(roomId, snapshot);
 
-        // If this was triggered by a specific mid-game joiner's request, forward
-        // the fresh snapshot directly to that player so they don't wait for the
-        // next periodic save.
         if (requestedBy) {
           io.to(requestedBy).emit(SOCKET_EVENTS.MID_GAME_JOIN_STATE, {
             canvasSnapshot: snapshot,
@@ -213,53 +228,49 @@ export function registerSocketHandlers(io: Server): void {
     );
 
     // ── Leave room ────────────────────────────────────────────────────────
-    socket.on(SOCKET_EVENTS.LEAVE_ROOM, (roomId: string) => {
-      const result = roomManager.removePlayer(socket.id);
+    socket.on(SOCKET_EVENTS.LEAVE_ROOM, async (roomId: string) => {
+      const result = await roomManager.removePlayer(socket.id);
       socket.leave(roomId);
       currentRoomId = null;
       if (result) {
         const { room, wasDrawer } = result;
         io.to(room.id).emit(SOCKET_EVENTS.NEW_MESSAGE, makeSystemMsg('A player left the room.'));
         io.to(room.id).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
-        if (wasDrawer && room.isPlaying) endTurn(io, room.id);
+        if (wasDrawer && room.isPlaying) await endTurn(io, room.id);
       }
-      broadcastLobby(io);
+      await broadcastLobby(io);
     });
 
     // ── Start game ────────────────────────────────────────────────────────
-    socket.on('startGame', (roomId: string) => {
-      const room = roomManager.startGame(roomId);
+    socket.on('startGame', async (roomId: string) => {
+      const room = await roomManager.startGame(roomId);
       if (!room) {
         socket.emit(SOCKET_EVENTS.ERROR, 'Cannot start game (need at least 2 players)');
         return;
       }
       io.to(roomId).emit(SOCKET_EVENTS.GAME_STARTED, room);
-      broadcastLobby(io);
-      startNewTurn(io, roomId);
+      await broadcastLobby(io);
+      await startNewTurn(io, roomId);
     });
 
     // ── Draw ──────────────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.DRAW, async (payload: DrawPayload) => {
-      // Relay to everyone else in the room
       socket.to(payload.roomId).emit(SOCKET_EVENTS.DRAW, payload.point);
 
-      // On stroke-end, ask the drawer for a fresh snapshot so Redis always
-      // has the latest canvas state ready for any mid-game joiners.
       if (payload.point.type === 'end') {
         socket.emit(SOCKET_EVENTS.REQUEST_CANVAS_SNAPSHOT, {
           roomId: payload.roomId,
-          requestedBy: null, // background save — no one to forward to
+          requestedBy: null,
         });
       }
     });
 
     // ── Clear canvas ──────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.CLEAR_CANVAS, async (payload: ClearCanvasPayload) => {
-      const room = roomManager.get(payload.roomId);
+      const room = await roomManager.get(payload.roomId);
       if (!room) return;
       if (room.currentDrawer === socket.id) {
         io.to(payload.roomId).emit(SOCKET_EVENTS.CLEAR_CANVAS);
-        // Wipe the stored snapshot — new joiners should see a blank canvas
         await roomManager.clearSnapshot(payload.roomId);
       }
     });
@@ -281,17 +292,19 @@ export function registerSocketHandlers(io: Server): void {
 
     // ── Guess ─────────────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.SEND_GUESS, async (payload: GuessPayload) => {
-      const room = roomManager.get(payload.roomId);
+      const room = await roomManager.get(payload.roomId);
       if (!room || !room.isPlaying) return;
       if (room.currentDrawer === socket.id) return;
 
-      const { correct, allGuessed } = roomManager.checkGuess(
+      const { correct, allGuessed } = await roomManager.checkGuess(
         payload.roomId,
         socket.id,
         payload.guess
       );
 
       if (correct) {
+        // Fetch updated room for latest scores
+        const updatedRoom = await roomManager.get(payload.roomId);
         io.to(payload.roomId).emit(SOCKET_EVENTS.NEW_MESSAGE, {
           id: uuidv4(),
           sender: payload.playerName,
@@ -303,8 +316,10 @@ export function registerSocketHandlers(io: Server): void {
           playerId: socket.id,
           playerName: payload.playerName,
         });
-        io.to(payload.roomId).emit(SOCKET_EVENTS.SCORES_UPDATE, room.players);
-        if (allGuessed) endTurn(io, payload.roomId);
+        if (updatedRoom) {
+          io.to(payload.roomId).emit(SOCKET_EVENTS.SCORES_UPDATE, updatedRoom.players);
+        }
+        if (allGuessed) await endTurn(io, payload.roomId);
       } else {
         io.to(payload.roomId).emit(SOCKET_EVENTS.NEW_MESSAGE, {
           id: uuidv4(),
@@ -323,27 +338,27 @@ export function registerSocketHandlers(io: Server): void {
 
       await roomManager.markDisconnected(socket.id, currentRoomId);
       socket.to(currentRoomId).emit('playerDisconnected', { socketId: socket.id });
-      broadcastLobby(io);
+      await broadcastLobby(io);
     });
   });
 }
 
 // ─── Turn management ──────────────────────────────────────────────────────────
 
-function startNewTurn(io: Server, roomId: string): void {
-  endingTurns.delete(roomId);
+async function startNewTurn(io: Server, roomId: string): Promise<void> {
+  // Release any lingering end-turn lock from the previous turn
+  await roomManager.releaseEndTurnLock(roomId);
 
-  // Clear the stored canvas snapshot — new turn = blank canvas
-  roomManager.clearSnapshot(roomId).catch(() => {});
+  await roomManager.clearSnapshot(roomId).catch(() => {});
+  io.to(roomId).emit(SOCKET_EVENTS.CLEAR_CANVAS);
 
-  const result = roomManager.startTurn(roomId);
+  const result = await roomManager.startTurn(roomId);
   if (!result) return;
 
   const { room, word, hint, drawer } = result;
 
   io.to(roomId).emit(SOCKET_EVENTS.ROOM_UPDATE, room);
   io.to(drawer.socketId).emit(SOCKET_EVENTS.YOUR_TURN, { word });
-
   io.to(roomId).emit(SOCKET_EVENTS.NEW_TURN, {
     drawerId: drawer.socketId,
     drawerName: drawer.name,
@@ -351,7 +366,6 @@ function startNewTurn(io: Server, roomId: string): void {
     round: room.currentRound,
     totalRounds: room.rounds,
   });
-
   io.to(roomId).emit(
     SOCKET_EVENTS.NEW_MESSAGE,
     makeSystemMsg(`${drawer.name} is now drawing! Guess the word!`)
@@ -359,7 +373,7 @@ function startNewTurn(io: Server, roomId: string): void {
 
   const hintArr: string[] = word.split('').map((ch) => (ch === ' ' ? ' ' : '_'));
 
-  const hintInterval = setInterval(() => {
+  const hintInterval = setInterval(async () => {
     const hiddenIndices = hintArr
       .map((ch, i) => (ch === '_' ? i : -1))
       .filter((i) => i !== -1);
@@ -373,26 +387,27 @@ function startNewTurn(io: Server, roomId: string): void {
     hintArr[pick] = word[pick];
     const newHint = hintArr.join(' ');
 
-    // Update the room's cached hint so mid-game joiners get the latest version
-    const r = roomManager.get(roomId);
-    if (r) r.currentHint = newHint;
+    // Persist updated hint to Redis so mid-game joiners get the latest
+    await roomManager.updateHint(roomId, newHint);
 
     broadcastHint(io, roomId, drawer.socketId, newHint);
   }, 15000);
 
   let timeLeft = room.drawTime;
-  const countdownInterval = setInterval(() => {
+  const countdownInterval = setInterval(async () => {
     timeLeft -= 1;
 
-    // Keep the room's timeLeft in sync for mid-game joiners
-    const r = roomManager.get(roomId);
-    if (r) r.currentTimeLeft = timeLeft;
+    // Persist timeLeft to Redis every 5s (not every second — reduces Redis load)
+    if (timeLeft % 5 === 0) {
+      await roomManager.updateTimeLeft(roomId, timeLeft);
+    }
 
     io.to(roomId).emit(SOCKET_EVENTS.TIMER_UPDATE, timeLeft);
+
     if (timeLeft <= 0) {
       clearInterval(countdownInterval);
       clearInterval(hintInterval);
-      endTurn(io, roomId);
+      await endTurn(io, roomId);
     }
   }, 1000);
 
@@ -400,19 +415,18 @@ function startNewTurn(io: Server, roomId: string): void {
   roomManager.setHintIntervalRef(roomId, hintInterval);
 }
 
-function endTurn(io: Server, roomId: string): void {
-  if (endingTurns.has(roomId)) return;
-  endingTurns.add(roomId);
+async function endTurn(io: Server, roomId: string): Promise<void> {
+  // Redis lock prevents double-fire across instances AND within same instance
+  const acquired = await roomManager.acquireEndTurnLock(roomId);
+  if (!acquired) return;
 
   roomManager.clearIntervalRef(roomId);
   roomManager.clearHintIntervalRef(roomId);
+  await roomManager.clearSnapshot(roomId).catch(() => {});
 
-  // Clear the snapshot now that the turn is over
-  roomManager.clearSnapshot(roomId).catch(() => {});
-
-  const room = roomManager.get(roomId);
+  const room = await roomManager.get(roomId);
   if (!room) {
-    endingTurns.delete(roomId);
+    await roomManager.releaseEndTurnLock(roomId);
     return;
   }
 
@@ -427,9 +441,9 @@ function endTurn(io: Server, roomId: string): void {
     makeSystemMsg(`The word was: "${wordReveal}"`)
   );
 
-  const advancement = roomManager.advanceRound(roomId);
+  const advancement = await roomManager.advanceRound(roomId);
   if (!advancement) {
-    endingTurns.delete(roomId);
+    await roomManager.releaseEndTurnLock(roomId);
     return;
   }
 
@@ -439,8 +453,8 @@ function endTurn(io: Server, roomId: string): void {
       players: advancement.room.players,
       winner,
     });
-    broadcastLobby(io);
-    endingTurns.delete(roomId);
+    await broadcastLobby(io);
+    await roomManager.releaseEndTurnLock(roomId);
 
     if (winner?.userId) {
       UserModel.findByIdAndUpdate(winner.userId, { $inc: { wins: 1 } }).catch(
@@ -448,6 +462,10 @@ function endTurn(io: Server, roomId: string): void {
       );
     }
   } else {
-    setTimeout(() => startNewTurn(io, roomId), 4000);
+    // 4s pause between turns, then release lock and start next turn
+    setTimeout(async () => {
+      await roomManager.releaseEndTurnLock(roomId);
+      await startNewTurn(io, roomId);
+    }, 4000);
   }
 }

@@ -2,6 +2,8 @@ import { v4 as uuidv4 } from 'uuid';
 import { Room, Player } from '../types';
 import { redis } from '../utils/redis';
 
+const ROOM_TTL = 7200; // 2 hours
+
 const WORDS: string[] = [
   'apple', 'banana', 'castle', 'dragon', 'elephant', 'flower', 'guitar',
   'hospital', 'island', 'jungle', 'kitchen', 'ladder', 'mountain', 'notebook',
@@ -17,24 +19,49 @@ const WORDS: string[] = [
 ];
 
 const getRandomWord = (): string => WORDS[Math.floor(Math.random() * WORDS.length)];
-
 const buildHint = (word: string): string =>
   word.split('').map((ch) => (ch === ' ' ? ' ' : '_')).join(' ');
 
+// ── Redis key helpers ──────────────────────────────────────────────────────
+const roomKey = (id: string) => `room:${id}`;
+const ROOMS_INDEX = 'rooms:index'; // Redis Set of all active room IDs
+
+// ── Redis helpers ──────────────────────────────────────────────────────────
+async function getRoom(roomId: string): Promise<Room | null> {
+  const data = await redis.get(roomKey(roomId)).catch(() => null);
+  if (!data) return null;
+  try { return JSON.parse(data) as Room; } catch { return null; }
+}
+
+async function saveRoom(room: Room): Promise<void> {
+  await Promise.all([
+    redis.set(roomKey(room.id), JSON.stringify(room), 'EX', ROOM_TTL),
+    redis.sadd(ROOMS_INDEX, room.id),
+  ]).catch(() => {});
+}
+
+async function deleteRoom(roomId: string): Promise<void> {
+  await Promise.all([
+    redis.del(roomKey(roomId)),
+    redis.srem(ROOMS_INDEX, roomId),
+  ]).catch(() => {});
+}
+
 class RoomManager {
-  private rooms: Map<string, Room> = new Map();
-  // Countdown interval for each room (ticks every second, emits TIMER_UPDATE)
+  // Timers stay in-memory — they cannot be serialized to Redis.
+  // Only the instance that called startTurn holds these.
   private intervals: Map<string, ReturnType<typeof setInterval>> = new Map();
-  // Hint reveal interval for each room (fires every 15s, reveals one letter)
   private hintIntervals: Map<string, ReturnType<typeof setInterval>> = new Map();
 
-  create(opts: {
+  // ── CRUD ────────────────────────────────────────────────────────────────
+
+  async create(opts: {
     name: string;
     maxPlayers: number;
     rounds: number;
     drawTime: number;
     creatorPlayer: Player;
-  }): Room {
+  }): Promise<Room> {
     const id = uuidv4().slice(0, 8).toUpperCase();
     const room: Room = {
       id,
@@ -46,35 +73,47 @@ class RoomManager {
       players: [opts.creatorPlayer],
       isPlaying: false,
     };
-    this.rooms.set(id, room);
-    redis.set(`player:${opts.creatorPlayer.userId}:room`, id, 'EX', 7200).catch(() => {});
+    await saveRoom(room);
+    await redis
+      .set(`player:${opts.creatorPlayer.userId}:room`, id, 'EX', ROOM_TTL)
+      .catch(() => {});
     return room;
   }
 
-  get(roomId: string): Room | undefined {
-    return this.rooms.get(roomId);
+  async get(roomId: string): Promise<Room | null> {
+    return getRoom(roomId);
   }
 
-  getAll(): Room[] {
-    return Array.from(this.rooms.values());
+  async getAll(): Promise<Room[]> {
+    const ids = await redis.smembers(ROOMS_INDEX).catch(() => [] as string[]);
+    if (!ids.length) return [];
+    const results = await Promise.all(ids.map((id) => getRoom(id)));
+    // Filter nulls (expired rooms) and clean up the index
+    const rooms: Room[] = [];
+    const expired: string[] = [];
+    results.forEach((r, i) => {
+      if (r) rooms.push(r);
+      else expired.push(ids[i]);
+    });
+    if (expired.length) {
+      await redis.srem(ROOMS_INDEX, ...expired).catch(() => {});
+    }
+    return rooms;
   }
 
-  delete(roomId: string): void {
+  async delete(roomId: string): Promise<void> {
     this.clearIntervalRef(roomId);
     this.clearHintIntervalRef(roomId);
-    this.rooms.delete(roomId);
+    await deleteRoom(roomId);
   }
 
-  /**
-   * addPlayer now accepts mid-game joins.
-   * Returns { room, isMidGameJoin } so the JOIN_ROOM handler
-   * knows whether to send the MID_GAME_JOIN_STATE catch-up packet.
-   */
-  addPlayer(
+  // ── Players ──────────────────────────────────────────────────────────────
+
+  async addPlayer(
     roomId: string,
     player: Player
-  ): { room: Room; isMidGameJoin: boolean } | null {
-    const room = this.rooms.get(roomId);
+  ): Promise<{ room: Room; isMidGameJoin: boolean } | null> {
+    const room = await getRoom(roomId);
     if (!room) return null;
     if (room.players.length >= room.maxPlayers) return null;
     if (room.players.find((p) => p.socketId === player.socketId)) {
@@ -82,43 +121,50 @@ class RoomManager {
     }
 
     const isMidGameJoin = room.isPlaying;
-
     room.players.push(player);
-
-    // Persist userId → roomId so rejoin works across restarts
-    redis.set(`player:${player.userId}:room`, room.id, 'EX', 7200).catch(() => {});
+    await saveRoom(room);
+    await redis
+      .set(`player:${player.userId}:room`, room.id, 'EX', ROOM_TTL)
+      .catch(() => {});
     return { room, isMidGameJoin };
   }
 
-  removePlayer(socketId: string): { room: Room; wasDrawer: boolean } | null {
-    for (const room of this.rooms.values()) {
+  async removePlayer(
+    socketId: string
+  ): Promise<{ room: Room; wasDrawer: boolean } | null> {
+    // We need to find which room this socket is in.
+    // Scan all rooms — in practice room counts are small.
+    const rooms = await this.getAll();
+    for (const room of rooms) {
       const idx = room.players.findIndex((p) => p.socketId === socketId);
-      if (idx !== -1) {
-        const player = room.players[idx];
-        redis.del(`player:${player.userId}:room`).catch(() => {});
+      if (idx === -1) continue;
 
-        const wasDrawer = room.currentDrawer === socketId;
-        room.players.splice(idx, 1);
-        if (wasDrawer) room.currentDrawer = undefined;
-        if (room.players.length === 0) {
-          this.delete(room.id);
-          return null;
-        }
-        return { room, wasDrawer };
+      const player = room.players[idx];
+      await redis.del(`player:${player.userId}:room`).catch(() => {});
+
+      const wasDrawer = room.currentDrawer === socketId;
+      room.players.splice(idx, 1);
+      if (wasDrawer) room.currentDrawer = undefined;
+
+      if (room.players.length === 0) {
+        await this.delete(room.id);
+        return null;
       }
+      await saveRoom(room);
+      return { room, wasDrawer };
     }
     return null;
   }
 
-  findRoomBySocket(socketId: string): Room | null {
-    for (const room of this.rooms.values()) {
-      if (room.players.find((p) => p.socketId === socketId)) return room;
-    }
-    return null;
+  async findRoomBySocket(socketId: string): Promise<Room | null> {
+    const rooms = await this.getAll();
+    return rooms.find((r) => r.players.find((p) => p.socketId === socketId)) ?? null;
   }
 
-  startGame(roomId: string): Room | null {
-    const room = this.rooms.get(roomId);
+  // ── Game flow ────────────────────────────────────────────────────────────
+
+  async startGame(roomId: string): Promise<Room | null> {
+    const room = await getRoom(roomId);
     if (!room || room.isPlaying || room.players.length < 2) return null;
     room.isPlaying = true;
     room.currentRound = 1;
@@ -127,16 +173,17 @@ class RoomManager {
       p.hasGuessedCorrectly = false;
       p.isDrawing = false;
     });
+    await saveRoom(room);
     return room;
   }
 
-  startTurn(roomId: string): {
+  async startTurn(roomId: string): Promise<{
     room: Room;
     word: string;
     hint: string;
     drawer: Player;
-  } | null {
-    const room = this.rooms.get(roomId);
+  } | null> {
+    const room = await getRoom(roomId);
     if (!room) return null;
 
     room.players.forEach((p) => {
@@ -144,7 +191,6 @@ class RoomManager {
       p.isDrawing = false;
     });
 
-    // Round-robin: (currentRound - 1) so round 1 starts at index 0
     const drawerIdx = (room.currentRound - 1) % room.players.length;
     const drawer = room.players[drawerIdx];
     drawer.isDrawing = true;
@@ -152,20 +198,20 @@ class RoomManager {
 
     const word = getRandomWord();
     room.currentWord = word;
-
     const hint = buildHint(word);
     room.currentHint = hint;
     room.currentTimeLeft = room.drawTime;
 
+    await saveRoom(room);
     return { room, word, hint, drawer };
   }
 
-  checkGuess(
+  async checkGuess(
     roomId: string,
     socketId: string,
     guess: string
-  ): { correct: boolean; allGuessed: boolean } {
-    const room = this.rooms.get(roomId);
+  ): Promise<{ correct: boolean; allGuessed: boolean }> {
+    const room = await getRoom(roomId);
     if (!room || !room.currentWord) return { correct: false, allGuessed: false };
 
     const correct = guess.trim().toLowerCase() === room.currentWord.toLowerCase();
@@ -188,11 +234,14 @@ class RoomManager {
     const nonDrawers = room.players.filter((p) => !p.isDrawing);
     const allGuessed = nonDrawers.every((p) => p.hasGuessedCorrectly);
 
+    await saveRoom(room);
     return { correct: true, allGuessed };
   }
 
-  advanceRound(roomId: string): { gameOver: boolean; room: Room } | null {
-    const room = this.rooms.get(roomId);
+  async advanceRound(
+    roomId: string
+  ): Promise<{ gameOver: boolean; room: Room } | null> {
+    const room = await getRoom(roomId);
     if (!room) return null;
 
     room.currentRound++;
@@ -200,12 +249,47 @@ class RoomManager {
       room.isPlaying = false;
       room.currentWord = undefined;
       room.currentDrawer = undefined;
+      await saveRoom(room);
       return { gameOver: true, room };
     }
+    await saveRoom(room);
     return { gameOver: false, room };
   }
 
-  // ── Countdown interval (one per room) ──────────────────────────────────
+  // ── Hint updates (called from handlers.ts during turn) ───────────────────
+
+  async updateHint(roomId: string, hint: string): Promise<void> {
+    const room = await getRoom(roomId);
+    if (!room) return;
+    room.currentHint = hint;
+    await saveRoom(room);
+  }
+
+  async updateTimeLeft(roomId: string, timeLeft: number): Promise<void> {
+    const room = await getRoom(roomId);
+    if (!room) return;
+    room.currentTimeLeft = timeLeft;
+    await saveRoom(room);
+  }
+
+  // ── Turn lock (prevents double endTurn across instances) ─────────────────
+  // Returns true if this instance successfully acquired the lock (i.e. it
+  // should proceed with ending the turn). False means another instance got
+  // there first.
+
+  async acquireEndTurnLock(roomId: string): Promise<boolean> {
+    // NX = only set if not exists, EX = expire after 10s (safety valve)
+const result = await redis
+  .set(`lock:ending:${roomId}`, '1', 'EX', 10, 'NX')
+  .catch(() => null);
+    return result === 'OK';
+  }
+
+  async releaseEndTurnLock(roomId: string): Promise<void> {
+    await redis.del(`lock:ending:${roomId}`).catch(() => {});
+  }
+
+  // ── Timer refs (in-memory, per-instance) ────────────────────────────────
 
   setIntervalRef(roomId: string, interval: ReturnType<typeof setInterval>): void {
     this.clearIntervalRef(roomId);
@@ -220,8 +304,6 @@ class RoomManager {
     }
   }
 
-  // ── Hint reveal interval (one per room) ────────────────────────────────
-
   setHintIntervalRef(roomId: string, interval: ReturnType<typeof setInterval>): void {
     this.clearHintIntervalRef(roomId);
     this.hintIntervals.set(roomId, interval);
@@ -235,18 +317,10 @@ class RoomManager {
     }
   }
 
-  // Kept for backward compat — no-ops now that we use intervals instead
-  setTimer(_roomId: string, _cb: () => void, _ms: number): void {}
-  clearTimer(_roomId: string): void {}
-
-  // ── Canvas snapshot (Redis, TTL = drawTime + 30s buffer) ──────────────
-  //
-  // We store the latest base64 PNG snapshot in Redis so:
-  //   1. It survives across multiple Node processes (multi-server deploy).
-  //   2. It auto-expires after the turn ends — no manual cleanup needed.
+  // ── Canvas snapshot ──────────────────────────────────────────────────────
 
   async saveSnapshot(roomId: string, snapshot: string): Promise<void> {
-    const room = this.rooms.get(roomId);
+    const room = await getRoom(roomId);
     const ttl = (room?.drawTime ?? 120) + 30;
     await redis.set(`canvas:${roomId}:snapshot`, snapshot, 'EX', ttl).catch(() => {});
   }
@@ -259,65 +333,77 @@ class RoomManager {
     await redis.del(`canvas:${roomId}:snapshot`).catch(() => {});
   }
 
-  // ── Reconnection support ──────────────────────────────────────────────
+  // ── Reconnection ─────────────────────────────────────────────────────────
 
-  private disconnected = new Map<string, { roomId: string; playerId: string; timer: ReturnType<typeof setTimeout> }>();
+  // In-memory grace-period timers (30s before force-removing a disconnected player)
+  private disconnectTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
   async markDisconnected(socketId: string, roomId: string): Promise<void> {
-    const room = this.rooms.get(roomId);
+    const room = await getRoom(roomId);
     if (!room) return;
 
-    const player = room.players.find(p => p.socketId === socketId);
+    const player = room.players.find((p) => p.socketId === socketId);
     if (!player) return;
 
     player.isConnected = false;
+    await saveRoom(room);
 
-    await redis.set(
-      `disconnected:${player.userId}`,
-      JSON.stringify({ roomId, socketId }),
-      'EX', 35
-    ).catch(() => {});
+    await redis
+      .set(
+        `disconnected:${player.userId}`,
+        JSON.stringify({ roomId, socketId }),
+        'EX',
+        35
+      )
+      .catch(() => {});
 
-    const timer = setTimeout(() => {
-      this.forceRemovePlayer(roomId, socketId);
-      redis.del(`disconnected:${player.userId}`).catch(() => {});
+    const timer = setTimeout(async () => {
+      await this.forceRemovePlayer(roomId, socketId);
+      await redis.del(`disconnected:${player.userId}`).catch(() => {});
+      this.disconnectTimers.delete(socketId);
     }, 30_000);
 
-    this.disconnected.set(socketId, { roomId, playerId: player.userId, timer });
+    this.disconnectTimers.set(socketId, timer);
   }
 
-  async rejoinRoom(roomId: string, playerId: string, newSocketId: string): Promise<Room | null> {
-    const room = this.rooms.get(roomId);
+  async rejoinRoom(
+    roomId: string,
+    playerId: string,
+    newSocketId: string
+  ): Promise<Room | null> {
+    const room = await getRoom(roomId);
     if (!room) return null;
 
-    const player = room.players.find(p => p.userId === playerId);
+    const player = room.players.find((p) => p.userId === playerId);
+    if (!player) return null;
 
-    if (player) {
-      const held = [...this.disconnected.values()]
-        .find(d => d.playerId === playerId && d.roomId === roomId);
-      if (held) {
-        clearTimeout(held.timer);
-        for (const [sid, d] of this.disconnected) {
-          if (d.playerId === playerId) { this.disconnected.delete(sid); break; }
-        }
-      }
-      await redis.del(`disconnected:${playerId}`).catch(() => {});
-      player.socketId    = newSocketId;
-      player.isConnected = true;
-      return room;
+    // Cancel the force-remove timer if it's still running
+    const timer = this.disconnectTimers.get(player.socketId);
+    if (timer) {
+      clearTimeout(timer);
+      this.disconnectTimers.delete(player.socketId);
     }
 
-    return null;
+    await redis.del(`disconnected:${playerId}`).catch(() => {});
+const wasDrawer = room.currentDrawer === player.socketId;
+player.socketId = newSocketId;
+player.isConnected = true;
+if (wasDrawer) {
+  room.currentDrawer = newSocketId;
+}
+await saveRoom(room);
+return room;
   }
 
-  private forceRemovePlayer(roomId: string, socketId: string): void {
-    const room = this.rooms.get(roomId);
+  private async forceRemovePlayer(roomId: string, socketId: string): Promise<void> {
+    const room = await getRoom(roomId);
     if (!room) return;
-    room.players = room.players.filter(p => p.socketId !== socketId);
+    room.players = room.players.filter((p) => p.socketId !== socketId);
     if (room.players.length === 0) {
-      this.rooms.delete(roomId);
+      await this.delete(roomId);
+    } else {
+      await saveRoom(room);
     }
-    this.disconnected.delete(socketId);
   }
 }
 
