@@ -142,6 +142,7 @@ export const SOCKET_EVENTS = {
   SEND_MESSAGE: 'sendMessage',
   NEW_MESSAGE: 'newMessage',
   SEND_GUESS: 'sendGuess',
+  
 
   // ── Mid-game join ─────────────────────────────────────────────
   // Server → drawer: "please send me your canvas as base64"
