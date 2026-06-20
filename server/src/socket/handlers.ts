@@ -76,6 +76,7 @@ export function registerSocketHandlers(io: Server): void {
         // fresh connection, no prior room
       }
     }
+
     // ── Lobby ─────────────────────────────────────────────────────────────
     socket.on(SOCKET_EVENTS.GET_ROOMS, () => {
       const rooms = roomManager.getAll().map((r) => ({
